@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -633,10 +633,19 @@ own, unmodified code.
 import argparse
 import builtins
 import importlib
+import os
 import re
 import sys
 
 TARGET_ATTR = "TARGET_FIRMWARE"
+
+# Exit codes the installer distinguishes.
+EXIT_OK = 0
+EXIT_PROBE_FAILED = 2
+EXIT_ABORTED = 3
+EXIT_NO_FLASH_PATH = 4
+EXIT_ENVIRONMENT = 5     # nothing a USB reset and a retry could fix
+EXIT_NEEDS_FLASH = 10
 
 
 def auto_input(prompt=""):
@@ -674,12 +683,28 @@ def main():
     parser.add_argument("--module", required=True, help="e.g. driver_52xd")
     parser.add_argument("--product", required=True, help="e.g. 0x521d")
     parser.add_argument("--extra-ok", default="", help="comma separated extra acceptable firmware strings")
+    parser.add_argument("--source-dir", required=True, help="the goodix-fp-dump checkout")
     parser.add_argument("--probe-only", action="store_true")
     parser.add_argument("--force", action="store_true", help="flash even if firmware is already acceptable")
     args = parser.parse_args()
 
+    # This script lives outside the goodix-fp-dump checkout, and Python seeds
+    # sys.path with the *script's* directory rather than the working directory,
+    # so the driver modules have to be put on the path explicitly. The drivers
+    # also open firmware/<family>/*.bin by relative path, hence the chdir.
+    source = os.path.abspath(args.source_dir)
+    if not os.path.isdir(source):
+        print("GFP_ERROR=source directory %s does not exist" % source, file=sys.stderr)
+        return EXIT_ENVIRONMENT
+    sys.path.insert(0, source)
+    os.chdir(source)
+
     product = int(args.product, 16)
-    driver = importlib.import_module(args.module)
+    try:
+        driver = importlib.import_module(args.module)
+    except ImportError as error:
+        print("GFP_ERROR=cannot import %s from %s: %s" % (args.module, source, error), file=sys.stderr)
+        return EXIT_ENVIRONMENT
 
     acceptable = [getattr(driver, TARGET_ATTR, "")]
     acceptable += [f for f in args.extra_ok.split(",") if f]
@@ -689,7 +714,7 @@ def main():
     except Exception as error:
         print("GFP_PROBE_ERROR=%s" % error)
         if args.probe_only:
-            return 2
+            return EXIT_PROBE_FAILED
         firmware, psk = None, None
     else:
         print("GFP_FIRMWARE=%s" % firmware)
@@ -702,16 +727,16 @@ def main():
         if already_ok:
             print("GFP_STATUS=ALREADY_SUPPORTED")
             if not args.force:
-                return 0
+                return EXIT_OK
             print("GFP_NOTE=forced reflash requested")
 
     if args.probe_only:
         print("GFP_STATUS=NEEDS_FLASH")
-        return 10
+        return EXIT_NEEDS_FLASH
 
     if not hasattr(driver, "run_driver"):
         print("GFP_STATUS=NO_FLASH_PATH")
-        return 4
+        return EXIT_NO_FLASH_PATH
 
     state = {"reached": False}
 
@@ -727,10 +752,10 @@ def main():
 
     if state["reached"]:
         print("GFP_STATUS=FLASHED")
-        return 0
+        return EXIT_OK
 
     print("GFP_STATUS=ABORTED")
-    return 3
+    return EXIT_ABORTED
 
 
 if __name__ == "__main__":
@@ -876,8 +901,9 @@ release_fprintd() {
 
 probe_firmware() {
     # Prints the driver's report; returns 0 = supported, 10 = flash needed, other = error.
-    ( cd "$SRC_DIR/goodix-fp-dump" && "$VENV_DIR/bin/python" "$BIN_DIR/gfp_flash.py" \
-        --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" --probe-only )
+    "$VENV_DIR/bin/python" "$BIN_DIR/gfp_flash.py" \
+        --source-dir "$SRC_DIR/goodix-fp-dump" \
+        --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" --probe-only
 }
 
 usb_reset() {
@@ -932,9 +958,10 @@ flash_firmware() {
     for (( attempt = 1; attempt <= FLASH_ATTEMPTS; attempt++ )); do
         info "Flash attempt $attempt of $FLASH_ATTEMPTS (running $RUN_SCRIPT)"
         rc=0
-        ( cd "$SRC_DIR/goodix-fp-dump" && "$VENV_DIR/bin/python" -u "$BIN_DIR/gfp_flash.py" \
+        "$VENV_DIR/bin/python" -u "$BIN_DIR/gfp_flash.py" \
+            --source-dir "$SRC_DIR/goodix-fp-dump" \
             --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" \
-            "${force_arg[@]}" ) || rc=$?
+            "${force_arg[@]}" || rc=$?
 
         if (( rc == 0 )); then
             FLASH_PERFORMED=1
@@ -942,6 +969,15 @@ flash_firmware() {
             release_fprintd
             sleep 2
             return 0
+        fi
+
+        # 3/4/5 are "no amount of retrying will help" — a broken checkout, a
+        # driver with no flash path, or upstream bailing out. Only USB-level
+        # failures are worth resetting and retrying.
+        if (( rc == 3 || rc == 4 || rc == 5 )); then
+            release_fprintd
+            err "The flashing tool could not run (exit $rc); retrying would not help."
+            die "Firmware flashing failed."
         fi
 
         warn "Attempt $attempt failed (exit $rc)."
