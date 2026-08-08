@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.2"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -659,6 +659,23 @@ def auto_input(prompt=""):
     return answer
 
 
+def release(device):
+    """Close the USB handle.
+
+    goodix.Device.disconnect() is *not* this: it blocks polling until the reader
+    physically detaches, which is what upstream wants after a reset. It never
+    frees the libusb handle, so calling it here would leave the interface
+    claimed and the next open in this process would fail with EBUSY.
+    """
+    try:
+        import usb.util
+        handle = getattr(getattr(device, "protocol", None), "device", None)
+        if handle is not None:
+            usb.util.dispose_resources(handle)
+    except Exception:
+        pass
+
+
 def probe(driver, product):
     """Return (firmware, psk_valid). Either may be None if unreadable."""
     device = None
@@ -672,10 +689,7 @@ def probe(driver, product):
         return firmware, psk
     finally:
         if device is not None:
-            try:
-                device.disconnect()
-            except Exception:
-                pass
+            release(device)
 
 
 def main():
@@ -684,8 +698,8 @@ def main():
     parser.add_argument("--product", required=True, help="e.g. 0x521d")
     parser.add_argument("--extra-ok", default="", help="comma separated extra acceptable firmware strings")
     parser.add_argument("--source-dir", required=True, help="the goodix-fp-dump checkout")
-    parser.add_argument("--probe-only", action="store_true")
-    parser.add_argument("--force", action="store_true", help="flash even if firmware is already acceptable")
+    parser.add_argument("--probe-only", action="store_true",
+                        help="report the firmware and exit; never opens the device twice")
     args = parser.parse_args()
 
     # This script lives outside the goodix-fp-dump checkout, and Python seeds
@@ -706,34 +720,36 @@ def main():
         print("GFP_ERROR=cannot import %s from %s: %s" % (args.module, source, error), file=sys.stderr)
         return EXIT_ENVIRONMENT
 
-    acceptable = [getattr(driver, TARGET_ATTR, "")]
-    acceptable += [f for f in args.extra_ok.split(",") if f]
+    # Probing and flashing must never share a process. USBProtocol claims the
+    # interface and nothing in goodix-fp-dump releases it, so a second
+    # init_device() in the same interpreter dies with EBUSY. The installer
+    # already runs the probe as its own process and decides from its exit code
+    # whether to invoke us again to flash.
+    if args.probe_only:
+        acceptable = [getattr(driver, TARGET_ATTR, "")]
+        acceptable += [f for f in args.extra_ok.split(",") if f]
 
-    try:
-        firmware, psk = probe(driver, product)
-    except Exception as error:
-        print("GFP_PROBE_ERROR=%s" % error)
-        if args.probe_only:
+        try:
+            firmware, psk = probe(driver, product)
+        except Exception as error:
+            print("GFP_PROBE_ERROR=%s" % error)
             return EXIT_PROBE_FAILED
-        firmware, psk = None, None
-    else:
+
         print("GFP_FIRMWARE=%s" % firmware)
         print("GFP_PSK_VALID=%s" % psk)
 
         target = getattr(driver, TARGET_ATTR, "")
-        # The target firmware also needs the driver PSK written, otherwise
+        # The target firmware still needs the driver PSK written, otherwise
         # upstream's own loop would erase and re-flash it anyway.
-        already_ok = (firmware in acceptable) and (firmware != target or psk is not False)
-        if already_ok:
+        if (firmware in acceptable) and (firmware != target or psk is not False):
             print("GFP_STATUS=ALREADY_SUPPORTED")
-            if not args.force:
-                return EXIT_OK
-            print("GFP_NOTE=forced reflash requested")
+            return EXIT_OK
 
-    if args.probe_only:
         print("GFP_STATUS=NEEDS_FLASH")
         return EXIT_NEEDS_FLASH
 
+    # Flash path. upstream's main() reads the firmware itself and drives the
+    # erase / PSK / flash loop, so there is nothing for us to check first.
     if not hasattr(driver, "run_driver"):
         print("GFP_STATUS=NO_FLASH_PATH")
         return EXIT_NO_FLASH_PATH
@@ -940,7 +956,7 @@ flash_firmware() {
     fi
 
     if (( FORCE_FLASH )) && (( probe_rc == 0 )); then
-        warn "--force-flash: downgrading even though the current firmware is usable."
+        warn "--force-flash: running the flasher even though the current firmware is usable."
     fi
 
     echo
@@ -952,16 +968,13 @@ flash_firmware() {
         die "Firmware flashing declined."
     fi
 
-    local attempt rc force_arg=()
-    if (( FORCE_FLASH )); then force_arg=(--force); fi
-
+    local attempt rc
     for (( attempt = 1; attempt <= FLASH_ATTEMPTS; attempt++ )); do
         info "Flash attempt $attempt of $FLASH_ATTEMPTS (running $RUN_SCRIPT)"
         rc=0
         "$VENV_DIR/bin/python" -u "$BIN_DIR/gfp_flash.py" \
             --source-dir "$SRC_DIR/goodix-fp-dump" \
-            --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" \
-            "${force_arg[@]}" || rc=$?
+            --module "$DRIVER_MODULE" --product "0x$DEV_PID" || rc=$?
 
         if (( rc == 0 )); then
             FLASH_PERFORMED=1
@@ -985,9 +998,6 @@ flash_firmware() {
             # This is the usbreset step from the README, done with an ioctl
             # instead of compiling usbreset.c.
             usb_reset
-            # After a partial flash the firmware has already changed; let
-            # upstream's own loop decide what to do from here.
-            force_arg=()
         fi
     done
 
