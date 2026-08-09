@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1306,13 +1306,25 @@ PYEOF
 # onto 1.94.10. sync_repo() checks out --force, so this reapplies every run.
 apply_sigfm_patch() {
     local src="$1"
+    local marker="$src/libfprint/fpi-image-device.h"
 
     [[ -n "$SIGFM_PATCH_FILE" ]] || die "The SIGFM patch was never located."
 
-    if [[ -d "$src/libfprint/sigfm" ]]; then
-        dbg "SIGFM sources already present."
+    # Guard on a *tracked* file. sync_repo() runs `git checkout --force`, which
+    # reverts every tracked change but leaves libfprint/sigfm/ in place because
+    # it is untracked. Keying off that directory made a re-run skip the patch
+    # while the core hooks it needs had already been reverted, and the build
+    # then failed with "FpImageDeviceClass has no member named 'algorithm'".
+    if grep -q 'FPI_DEVICE_ALGO_SIGFM' "$marker" 2>/dev/null \
+       && [[ -d "$src/libfprint/sigfm" ]]; then
+        dbg "SIGFM port already applied."
         return 0
     fi
+
+    # Half-applied either way round: start from the pristine checkout. This runs
+    # before the other three patches, so nothing else is lost.
+    git -C "$src" checkout --force -- . >/dev/null 2>&1 || true
+    rm -rf "$src/libfprint/sigfm"
 
     if ! git -C "$src" apply --whitespace=nowarn "$SIGFM_PATCH_FILE"; then
         err "The SIGFM patch did not apply to this libfprint checkout."

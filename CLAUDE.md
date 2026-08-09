@@ -183,13 +183,26 @@ produced `error: redefinition of 'fp_image_get_sigfm_info'` on the first real
 build. Count hunks (`grep -c '^@@'` over that file's slice of the patch) against
 rejects before assuming a file is untouched.
 
-**Local compile check.** `scratchpad/check.sh` syntax-checks the five patched
-core files with Ubuntu's flags (`-std=gnu99 -Wall -Werror=implicit …`). It works
-because `mkenums.py` fakes meson's `gnome.mkenums_simple()` output and
-`stub/{config.h,gusb.h}` stand in for the Linux-only pieces; `fpi-image.c` is
-excluded since the port does not touch it and it needs pixman. Run it after any
-change to the port — it catches redefinitions, missing declarations and enum
-mismatches, which is most of what goes wrong here.
+**Local compile check.** `scratchpad/check.sh` syntax-checks all six patched C
+files **including `drivers/goodixtls/goodix52xd.c`** plus `sigfm.cpp`, with
+Ubuntu's flags (`-std=gnu99 -Wall -Werror=implicit …`). It works because
+`mkenums.py` fakes meson's `gnome.mkenums_simple()` output and
+`stub/{config.h,gusb.h,gusb/gusb-device.h}` stand in for the Linux-only pieces;
+`fpi-image.c` is excluded since the port does not touch it and it needs pixman.
+Run it after any change — it catches redefinitions, missing declarations and
+enum mismatches, which is most of what goes wrong here. It does **not** check
+linking.
+
+**Idempotency: guard on tracked files only.** `sync_repo()` runs
+`git checkout --force`, which reverts tracked changes but leaves the *untracked*
+`libfprint/sigfm/` behind. `apply_sigfm_patch()` originally keyed its
+already-applied check off that directory, so a second run skipped the patch while
+the core hooks had been reverted — the build then failed with
+`FpImageDeviceClass has no member named 'algorithm'`. It now requires both a
+tracked marker (`FPI_DEVICE_ALGO_SIGFM` in `fpi-image-device.h`) *and* the
+directory, and resets to pristine if only one is present. `scratchpad/idem.sh`
+exercises all four states (pristine, already-applied, and both half-applied
+directions).
 
 **Verification status.** libfprint as a whole cannot be built on this machine
 (gudev/udev). What *is* checked: the patch applies clean to pristine 1.94.10 and
