@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths — must match install.sh
@@ -55,6 +55,8 @@ REPORT="${GOODIX_DEBUG_OUT:-/tmp/goodix-fp-debug.log}"
 CAPTURE_SECS=45
 DO_CAPTURE=1
 DO_PRINT=1
+DO_MATCH=0
+MATCH_ROUNDS=3
 
 # ---------------------------------------------------------------------------
 # Runtime state
@@ -68,6 +70,8 @@ EXTRA_FW=""
 FPRINTD_MASKED=0
 PROBE_FIRMWARE=""
 PROBE_PSK=""
+TTY_FD_OPEN=0
+MATCH_WORK=""
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -89,6 +93,25 @@ err()  { printf '  %sx%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die() { err "$*"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# `curl | sudo bash` leaves stdin pointing at the pipe, so anything that has to
+# ask the user a question has to read the terminal directly.
+tty_open() {
+    (( TTY_FD_OPEN )) && return 0
+    exec {TTY_FD}</dev/tty 2>/dev/null || return 1
+    TTY_FD_OPEN=1
+}
+
+# prompt_enter "message" — shows the message, waits for Return. Returns 1 if
+# there is no terminal to ask on.
+prompt_enter() {
+    tty_open || return 1
+    printf '\n  %s%s%s  [Enter] ' "$C_BOLD" "$1" "$C_RESET"
+    local _discard
+    read -r _discard <&"$TTY_FD" || return 1
+    printf '\n'
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # Report helpers
@@ -155,10 +178,17 @@ Options (pass as: ... | sudo bash -s -- --flag):
   -t, --timeout N    Seconds to keep each capture test running (default: $CAPTURE_SECS).
       --no-capture   Collect state only; don't touch the reader.
       --no-print     Don't echo the report at the end, just write the file.
+      --match-test   Measure whether the matcher can actually tell fingers
+                     apart. Enrolls into a scratch directory, then asks you to
+                     scan that same finger and afterwards a different one, and
+                     records the match score of every attempt. Needs a terminal.
+                     Implies --no-capture. Enrolls nothing on your account.
+      --rounds N     Scans per finger in --match-test (default: $MATCH_ROUNDS).
   -h, --help         This text.
   -V, --version      Print the version and exit.
 
-Changes nothing. Stops fprintd while the capture tests run, restarts it after.
+Changes nothing. Stops fprintd while the tests run and restarts it after,
+including on Ctrl-C.
 EOF
 }
 
@@ -169,6 +199,8 @@ parse_args() {
             -t|--timeout)  CAPTURE_SECS="${2:?--timeout needs a number}"; shift ;;
             --no-capture)  DO_CAPTURE=0 ;;
             --no-print)    DO_PRINT=0 ;;
+            --match-test)  DO_MATCH=1; DO_CAPTURE=0 ;;
+            --rounds)      MATCH_ROUNDS="${2:?--rounds needs a number}"; shift ;;
             -h|--help)     usage; exit 0 ;;
             -V|--version)  echo "goodix-fp-debug $SCRIPT_VERSION"; exit 0 ;;
             *)             usage >&2; die "Unknown option: $1" ;;
@@ -177,6 +209,7 @@ parse_args() {
     done
 
     [[ "$CAPTURE_SECS" =~ ^[0-9]+$ ]] || die "--timeout takes a whole number of seconds."
+    [[ "$MATCH_ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "--rounds takes a whole number of scans."
 }
 
 # ---------------------------------------------------------------------------
@@ -206,7 +239,9 @@ release_fprintd() {
 cleanup() {
     # goodix-fp-dump leaves an openssl TLS server behind if it dies mid-capture.
     pkill -f 'openssl s_server -nocert -psk' >/dev/null 2>&1 || true
+    [[ -n "$MATCH_WORK" && -d "$MATCH_WORK" ]] && rm -rf "$MATCH_WORK"
     release_fprintd
+    return 0
 }
 
 on_exit() { cleanup; }
@@ -451,6 +486,220 @@ PYEOF
     fi
 }
 
+# Renders a PGM as coarse ASCII so it lands in the pasteable report. A real
+# fingerprint shows ridges; sensor noise or a fixed pattern does not, and that
+# distinction is the whole question when unrelated fingers match.
+render_pgm_ascii() {
+    local pgm="$1" label="$2"
+
+    [[ -s "$pgm" ]] || { rep "($label: no image written)"; return 0; }
+    rep ""
+    rep "$label ($(basename "$pgm")):"
+    python3 - "$pgm" <<'PYEOF' >>"$REPORT" 2>&1 || rep "  (could not render)"
+import sys
+
+RAMP = " .:-=+*#%@"
+
+with open(sys.argv[1], "rb") as handle:
+    blob = handle.read()
+
+# libfprint writes "P5 <w> <h> 255\n" as one line, but the format allows the
+# fields to be split across lines and interleaved with # comments, so scan
+# bytes rather than assume a layout. Exactly one whitespace byte follows
+# maxval; everything after it is raster.
+pos, fields = 0, []
+while len(fields) < 4 and pos < len(blob):
+    if blob[pos:pos + 1].isspace():
+        pos += 1
+        continue
+    if blob[pos:pos + 1] == b"#":
+        while pos < len(blob) and blob[pos:pos + 1] != b"\n":
+            pos += 1
+        continue
+    start = pos
+    while pos < len(blob) and not blob[pos:pos + 1].isspace():
+        pos += 1
+    fields.append(blob[start:pos])
+
+if len(fields) < 4:
+    print("  (header is incomplete — not a PGM?)")
+    sys.exit(0)
+if fields[0] != b"P5":
+    print("  (not a P5 PGM: %s)" % fields[0].decode("ascii", "replace"))
+    sys.exit(0)
+try:
+    width, height, maxval = (int(f) for f in fields[1:4])
+except ValueError:
+    print("  (unreadable header: %s)"
+          % b" ".join(fields[1:4]).decode("ascii", "replace"))
+    sys.exit(0)
+if width <= 0 or height <= 0:
+    print("  (degenerate size %dx%d)" % (width, height))
+    sys.exit(0)
+
+data = blob[pos + 1:pos + 1 + width * height]
+
+if len(data) < width * height:
+    print("  (truncated raster: %d of %d bytes)" % (len(data), width * height))
+    sys.exit(0)
+
+cols, rows = 48, 24
+lo, hi = min(data), max(data)
+span = hi - lo
+print("  %dx%d, pixel values %d-%d (maxval %d)" % (width, height, lo, hi, maxval))
+if span == 0:
+    print("  uniform image — no detail at all")
+    sys.exit(0)
+
+for r in range(rows):
+    line = []
+    for c in range(cols):
+        y0, y1 = r * height // rows, max(r * height // rows + 1, (r + 1) * height // rows)
+        x0, x1 = c * width // cols, max(c * width // cols + 1, (c + 1) * width // cols)
+        block = [data[y * width + x] for y in range(y0, y1) for x in range(x0, x1)]
+        level = (sum(block) // len(block) - lo) * (len(RAMP) - 1) // span
+        line.append(RAMP[level])
+    print("  |%s|" % "".join(line))
+PYEOF
+    return 0
+}
+
+# match_test_scan <binary> <stdin-keys> <prompt> <outfile> <seconds>
+# Runs one example binary against the reader and records everything it printed.
+# Returns 1 only if there was no terminal to ask on, so callers can give up.
+match_test_scan() {
+    local bin="$1" keys="$2" prompt="$3" out="$4" secs="$5" rc=0
+
+    prompt_enter "$prompt" || return 1
+    info "Scanning — follow the prompts the example prints (up to ${secs}s)."
+    ( cd "$MATCH_WORK" && printf '%b' "$keys" \
+        | timeout -k 5 -s INT "${secs}s" env G_MESSAGES_DEBUG=all "$bin" ) \
+        >"$out" 2>&1 || rc=$?
+    printf '%s\n' "[exit $rc]" >>"$out"
+    if (( rc == 124 || rc == 130 )); then
+        printf '%s\n' "[timed out after ${secs}s — pass -t N for longer]" >>"$out"
+    fi
+    return 0
+}
+
+# The match score is the only number that says whether these images carry any
+# real signal. libfprint logs it from fpi_print_bz3_match() at debug level, and
+# examples/{enroll,verify} drive the same driver and matcher fprintd does with
+# no D-Bus or polkit in the way. Everything stays in a scratch directory, so
+# your real enrollments are neither read nor written.
+collect_match_test() {
+    sec "Matcher separation test"
+
+    local enroll="$BUILD_DIR/examples/enroll" verify="$BUILD_DIR/examples/verify"
+
+    if [[ ! -x "$enroll" || ! -x "$verify" ]]; then
+        rep "(examples/enroll or examples/verify missing under $BUILD_DIR)"
+        warn "libfprint's example binaries are gone; re-run install.sh, then retry."
+        return 0
+    fi
+    if ! tty_open; then
+        rep "(no terminal available — the test has to ask you to change fingers)"
+        warn "--match-test needs a terminal; run it from a shell you can type into."
+        return 0
+    fi
+
+    MATCH_WORK="$(mktemp -d /tmp/goodix-match-XXXXXX)" || return 0
+    rep "scratch directory: $MATCH_WORK (deleted on exit)"
+    rep "rounds per finger:  $MATCH_ROUNDS"
+
+    local log="$MATCH_WORK/round.log"
+    local same=() other=() threshold=""
+
+    printf '\n'
+    printf '  %sWhat happens next:%s first you enroll one finger into a scratch\n' "$C_BOLD" "$C_RESET"
+    printf '  store. Then you scan that same finger %s times, then a %sdifferent%s\n' "$MATCH_ROUNDS" "$C_BOLD" "$C_RESET"
+    printf '  finger %s times. Nothing is saved to your account.\n' "$MATCH_ROUNDS"
+
+    # Enrolment is five presses, so it needs several times a single scan's budget.
+    sec "Matcher separation test — enrolment"
+    match_test_scan "$enroll" '6\ny\n' \
+        "Enrol now: press and lift your RIGHT INDEX finger when asked." \
+        "$log" "$(( CAPTURE_SECS * 4 ))" || { rep "(aborted at the terminal)"; return 0; }
+    cat "$log" >>"$REPORT"
+    render_pgm_ascii "$MATCH_WORK/enrolled.pgm" "enrolled image"
+
+    if ! grep -q 'Enrollment completed' "$log" && ! grep -q 'enroll-completed' "$log"; then
+        note "Enrolment did not report success, so the scores below may be meaningless."
+        warn "Enrolment did not complete; carrying on so you can still see the output."
+    fi
+
+    local kind label i score
+    for kind in same other; do
+        for (( i = 1; i <= MATCH_ROUNDS; i++ )); do
+            if [[ "$kind" == "same" ]]; then
+                label="same finger, round $i/$MATCH_ROUNDS"
+                sec "Matcher separation test — $label"
+                match_test_scan "$verify" '6\n' \
+                    "Press the SAME finger you just enrolled ($i of $MATCH_ROUNDS)." \
+                    "$log" "$CAPTURE_SECS" || break 2
+            else
+                label="different finger, round $i/$MATCH_ROUNDS"
+                sec "Matcher separation test — $label"
+                match_test_scan "$verify" '6\n' \
+                    "Now press a DIFFERENT finger — other hand, or a toe ($i of $MATCH_ROUNDS)." \
+                    "$log" "$CAPTURE_SECS" || break 2
+            fi
+
+            cat "$log" >>"$REPORT"
+            render_pgm_ascii "$MATCH_WORK/verify.pgm" "scanned image ($label)"
+
+            score="$(grep -oE 'score [0-9]+/[0-9]+' "$log" | tail -n 1 || true)"
+            if [[ -n "$score" ]]; then
+                threshold="${score##*/}"
+                score="${score#score }"; score="${score%%/*}"
+                rep "==> $label: score $score (threshold ${threshold})"
+                if [[ "$kind" == "same" ]]; then same+=("$score"); else other+=("$score"); fi
+            else
+                rep "==> $label: no score logged (no minutiae, or the scan never landed)"
+            fi
+            rm -f "$MATCH_WORK/verify.pgm"
+        done
+    done
+
+    sec "Matcher separation test — verdict"
+    rep "threshold in this build: ${threshold:-unknown}"
+    rep "same-finger scores:      ${same[*]:-none}"
+    rep "different-finger scores: ${other[*]:-none}"
+
+    if (( ${#other[@]} )) && [[ -n "$threshold" ]]; then
+        local worst=0 s
+        for s in "${other[@]}"; do (( s > worst )) && worst="$s"; done
+        if (( worst >= threshold )); then
+            rep ""
+            rep "FAIL OPEN: a finger that was never enrolled scored $worst against a"
+            rep "threshold of $threshold. This reader authenticates the wrong finger."
+            rep "Do not use it for login. Raise the threshold above $worst with"
+            rep "GOODIX_BZ3_THRESHOLD, or stop using fingerprint authentication."
+            err "A different finger matched (score $worst vs threshold $threshold)."
+        else
+            rep ""
+            rep "No unenrolled finger reached the threshold in $MATCH_ROUNDS attempts."
+            rep "That is not proof of safety — it is $MATCH_ROUNDS samples."
+            ok "No wrong-finger match in $MATCH_ROUNDS attempts."
+        fi
+    fi
+
+    if (( ${#same[@]} )) && [[ -n "$threshold" ]]; then
+        local best=0 s
+        for s in "${same[@]}"; do (( s > best )) && best="$s"; done
+        if (( best < threshold )); then
+            rep ""
+            rep "The enrolled finger never reached the threshold either (best $best of"
+            rep "$threshold), so this build will refuse you as well. If the numbers"
+            rep "above show no gap between the two groups, the images carry no usable"
+            rep "ridge detail and no threshold can fix it."
+            warn "The enrolled finger also failed to match (best $best of $threshold)."
+        fi
+    fi
+
+    return 0
+}
+
 collect_tail() {
     sec "Installer log (tail)"
     runsh "goodix-fp-setup.log" "tail -n 150 '$SETUP_LOG' 2>/dev/null || echo '(no installer log)'"
@@ -492,9 +741,18 @@ main() {
         guard capture_fpdump
         release_fprintd
         ok "fprintd restarted."
-    else
+    elif (( ! DO_MATCH )); then
         step "Skipping the capture tests (--no-capture)"
         note "Capture tests were skipped with --no-capture."
+    fi
+
+    if (( DO_MATCH )); then
+        step "Measuring matcher separation"
+        info "Stopping fprintd so it releases the device"
+        hold_fprintd
+        guard collect_match_test
+        release_fprintd
+        ok "fprintd restarted."
     fi
 
     guard collect_tail

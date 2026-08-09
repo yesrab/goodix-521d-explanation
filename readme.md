@@ -36,6 +36,21 @@ Two patches are applied to that fork before building:
 
 1. Its 52XD driver ships the TLS pre-shared key for `10034` but not for `10019`, so a reader on `10019` opens fine and then fails every enroll with `Goodix TLS PSK is not configured`. The `10019` key is 32 zero bytes — the value `goodix-fp-dump` writes to the sensor, and the one whose sha256 is the driver's own `goodix_52xd_pmk_hash_10019` — so the script puts it back.
 2. Its "sensor is empty again" test can never match on some 521d units, which makes the reader appear to hang for tens of seconds between enroll scans. The saturated-frame rule wants `high_pixels >= 5100` out of 64×80 pixels, but ~284 of them never cross the threshold, so it tops out at 4836. The script lowers that cut to where the hardware actually separates. `GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS=1` builds the stock values instead.
+3. Its 52XD driver sets the match threshold to 24, well under libfprint's own default of 40, while handing the matcher a single 64×80 frame with no calibration frame subtracted and no frame stitching — so fingers that were never enrolled can clear it. The script raises it to 40. `GOODIX_BZ3_THRESHOLD=<n>` builds a different value. See the warning below.
+
+### ⚠ This reader may accept the wrong finger
+
+On at least one 521d, an enrolled finger and a completely different one both verified successfully. The cause is in the driver, not in the threshold alone: `goodix52xd_image_from_frame()` contrast-stretches **one** raw 64×80 frame and doubles it to 128×160, with no calibration frame subtracted and no stitching. The sibling `goodix511` driver captures 40 frames and runs `fpi_assemble_frames()` over them; the 52XD driver does neither. NBIS therefore finds few real minutiae — you will see `Failed to detect minutiae: No minutiae found` in the fprintd journal — and what it does find comes partly from the sensor's fixed pattern, which is identical no matter whose finger is on it.
+
+Raising the threshold makes the reader fail closed rather than fail open, but it does not create ridge detail that was never captured. **Test your own reader before trusting it with a login:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/debug.sh | sudo bash -s -- --match-test
+```
+
+That enrolls a finger into a scratch directory, asks you to scan the same finger and then a different one, and prints the match score of every attempt alongside an ASCII rendering of each captured image. If a finger you never enrolled reaches the threshold, the report says so in as many words. Nothing is written to your account and the scratch directory is deleted on exit.
+
+If the two groups of scores overlap, no threshold setting can separate them and the reader is not usable for authentication as things stand.
 
 **Windows broke the reader again?** The script installs `goodix-fp-fix`; just run `sudo goodix-fp-fix`.
 
@@ -44,6 +59,8 @@ Two patches are applied to that fork before building:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/debug.sh | sudo bash
 ```
+
+Add `--match-test` to measure whether the matcher can actually tell your fingers apart — see the warning above.
 
 Everything is still experimental. Read the warning in the next section — it applies just as much to the automated path.
 

@@ -66,8 +66,39 @@ Applied in `build_libfprint()` before meson runs. `sync_repo()` does
    (margins 90 and 311). Opt out with `GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS=1`.
    Guard: `grep -q 'goodix-fp-setup'`.
 
-Both are tuned from **one** reader's log. Treat the thresholds as hardware-specific
-until someone else confirms them.
+3. **`patch_libfprint_52xd_bz3()`** → `drivers/goodixtls/goodix52xd.c`.
+   The driver sets `bz3_threshold = 24` (libfprint's own default is 40) and
+   unrelated fingers cleared it — a confirmed false-accept on real hardware.
+   Raised to 40 so it fails closed. `GOODIX_BZ3_THRESHOLD=<n>` overrides.
+   Guard: `grep -q 'bz3-threshold'` — note the PSK patch also writes the string
+   `goodix-fp-setup` into this same file, so the guards must stay distinct.
+
+Patches 2 and 3 are tuned from **one** reader. Treat the values as
+hardware-specific until someone else confirms them.
+
+### The false-accept problem (the important open issue)
+
+A finger that was never enrolled verifies successfully. The threshold was only
+half of it — the root cause is the image the driver produces:
+
+- `goodix52xd_image_from_frame()` takes **one** raw 64×80 frame,
+  `squash_frame_linear()` stretches its own min/max to 0–255, and it is
+  nearest-neighbour doubled to 128×160. That is the entire image pipeline.
+- No calibration/background frame is subtracted. The 52XD driver has no
+  `empty_img` field at all, whereas `goodix511` has one, captures
+  `GOODIX511_CAP_FRAMES 40` frames per scan, and runs
+  `fpi_do_movement_estimation()` + `fpi_assemble_frames()` over them.
+- `self->frames` exists on the 52XD device struct but is only ever freed —
+  dead code, no accumulation.
+- Consequence: NBIS extracts few minutiae (hence `No minutiae found` in the
+  journal) and those it finds are partly the sensor's fixed pattern, which is
+  the same for every finger. So any two prints score alike.
+
+Raising the threshold cannot manufacture ridge detail. The real fixes, roughly
+in order of effort: subtract a background frame (the last frame
+`goodix52xd_frame_is_empty()` accepted while waiting *is* a background frame,
+so this is tractable); pick the best of several frames after finger-down instead
+of the first non-empty one; or port SIGFM. None are done.
 
 ## How debug.sh works
 
@@ -77,7 +108,17 @@ can paste one block. Sections: system, reader on the USB bus, installed state, t
 with `G_MESSAGES_DEBUG=all`, a goodix-fp-dump control test, and the installer log tail.
 Flags: `-o/--out`, `-t/--timeout` (default 45), `--no-capture`, `--no-print`, `-h`, `-V`.
 
-Two invariants that must survive edits:
+`--match-test` (v1.1.0) measures whether the matcher separates fingers at all:
+enrol into a `mktemp -d`, then N verifies with the same finger and N with a
+different one, recording each `score N/M` that `fpi_print_bz3_match()` logs. It
+drives `$BUILD_DIR/examples/{enroll,verify}` rather than fprintd — no D-Bus, no
+polkit, and the user's real enrollments are neither read nor written. Those
+examples store to `test-storage.variant` in the **cwd** and write
+`enrolled.pgm` / `verify.pgm`, which `render_pgm_ascii()` turns into ASCII so
+the images land in the pasteable report. The driver can also dump frames
+itself via `GOODIX52XD_DUMP_DIR` + `GOODIX52XD_DUMP_RAW=1`.
+
+Three invariants that must survive edits:
 
 - **`guard()` wraps every section.** Under `set -Eeuo pipefail` any section returning
   non-zero would kill the run before the report printed — that bug shipped once in
@@ -85,6 +126,9 @@ Two invariants that must survive edits:
   function on a bare test; use explicit `if`/`else` and `return 0`.
 - **The control test refuses to run unless firmware is already the target and the PSK
   patch is present.** A diagnostic run must never risk a reflash.
+- **`--match-test` never claims safety from absent data.** If the user aborts, or
+  no score is logged, it prints the partial numbers and no verdict. Only an
+  unenrolled finger actually reaching the threshold produces the FAIL OPEN text.
 
 `fprintd` is stopped and masked for the duration and restored by a
 `trap on_exit EXIT INT TERM`.
@@ -113,8 +157,9 @@ Two invariants that must survive edits:
 
 ## Open items
 
-- **`Failed to detect minutiae: No minutiae found`** recurs in the fprintd journal.
-  NBIS coping badly with 64×80 images. Intermittent, not fatal — enrollment succeeds.
+- **False accepts are unresolved.** See "The false-accept problem" above. The
+  threshold bump is a mitigation, not a fix. Waiting on `--match-test` numbers
+  from the user's reader to know whether the score distributions overlap.
 - **SIGFM** (`goodix-fp-linux-dev/sigfm`) is the right answer to that: a SIFT matcher
   written specifically for 64×80 sensors. **Not usable today** — no published branch
   combines `libfprint/sigfm/` with the goodixtls 52xd driver. The org's `sigfm`
@@ -125,6 +170,9 @@ Two invariants that must survive edits:
   `fp-print.c` (12) from 1.94.5 → 1.94.10. It also changes the stored print format
   (SIFT descriptors vs NBIS minutiae), invalidating existing enrollments.
   Gate on evidence: only worth it if `fprintd-verify` shows frequent false rejects.
-- **Both patched bugs are upstream bugs** in `djnz00/libfprint` (missing 10019 PSK;
-  unreachable `5100` threshold) and are worth reporting there. Not yet filed.
-- v1.0.4 has **not** been confirmed on hardware yet.
+- **Three upstream bugs** in `djnz00/libfprint` worth reporting, none filed: the
+  missing 10019 PSK, the unreachable `5100` threshold, and the false accepts
+  (single-frame image + no background subtraction + `bz3_threshold = 24`, which
+  the 511 and 53xd drivers share).
+- install.sh v1.0.5 / debug.sh v1.1.0 have **not** been confirmed on hardware.
+  The finger-off fix in 1.0.4 was — scanning is fast now.

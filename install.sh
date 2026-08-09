@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.4"
+readonly SCRIPT_VERSION="1.0.5"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1150,6 +1150,69 @@ PYEOF
     fi
 }
 
+# The 52XD driver sets the bozorth3 match threshold to 24, well under
+# libfprint's own default of 40, and it feeds the matcher a *single* 64x80
+# frame: goodix52xd_image_from_frame() contrast-stretches one raw frame and
+# nearest-neighbour doubles it to 128x160. There is no calibration frame
+# subtracted and no frame stitching — the sibling goodix511 driver captures 40
+# frames and runs fpi_assemble_frames() over them, and the 52XD driver has
+# neither. NBIS therefore extracts very few minutiae, mostly from the sensor's
+# fixed pattern rather than from ridges, so unrelated fingers clear a score of
+# 24 and the reader authenticates anybody.
+#
+# 24 -> 40 makes it fail closed rather than fail open. That is the right
+# direction for an authentication device even if it costs some genuine matches.
+# Set GOODIX_BZ3_THRESHOLD=<n> to build a different value once you have
+# measured your own scores with `debug.sh --match-test`.
+#
+# sync_repo() checks out --force, so this is re-applied on every run.
+patch_libfprint_52xd_bz3() {
+    local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
+    local want="${GOODIX_BZ3_THRESHOLD:-40}"
+
+    [[ -f "$file" ]] || return 0
+    if [[ ! "$want" =~ ^[0-9]+$ ]]; then
+        warn "GOODIX_BZ3_THRESHOLD='$want' is not a number; leaving the driver's own value."
+        return 0
+    fi
+    if grep -q 'bz3-threshold' "$file"; then
+        dbg "goodix52xd.c match threshold already adjusted."
+        return 0
+    fi
+
+    if python3 - "$file" "$want" <<'PYEOF'
+import sys
+
+path, want = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    source = handle.read()
+
+old = "  img_dev_class->bz3_threshold = 24;\n"
+
+new = """  /* bz3-threshold: raised from the driver's 24 by goodix-fp-setup. The 52XD
+     matcher sees one contrast-stretched 64x80 frame with no calibration frame
+     subtracted, so NBIS finds few real minutiae and unrelated fingers clear a
+     score of 24. Failing closed beats authenticating anybody. */
+  img_dev_class->bz3_threshold = %s;
+""" % want
+
+if source.count(old) != 1:
+    sys.exit(1)
+
+with open(path, "w") as handle:
+    handle.write(source.replace(old, new))
+PYEOF
+    then
+        ok "Raised the 52XD match threshold to $want (driver ships 24)."
+        if (( want < 40 )); then
+            warn "$want is below libfprint's default of 40; unrelated fingers may still match."
+        fi
+    else
+        warn "Could not adjust the 52XD match threshold — the driver may have changed."
+        warn "Do not use fingerprint login until you have verified a wrong finger is rejected."
+    fi
+}
+
 build_libfprint() {
     step "Building patched libfprint"
 
@@ -1158,6 +1221,7 @@ build_libfprint() {
 
     patch_libfprint_52xd_psk "$src"
     patch_libfprint_52xd_finger_off "$src"
+    patch_libfprint_52xd_bz3 "$src"
 
     local optfile="" candidate
     for candidate in meson_options.txt meson.options; do
