@@ -32,6 +32,8 @@ Run `... \| sudo bash -s -- --help` for the full list. The log is at `/var/log/g
 
 **Which libfprint does it build?** By default, [`djnz00/libfprint`](https://github.com/djnz00/libfprint) — libfprint 1.94.10, actively maintained, and it accepts the **stock** `GFUSB_GM168SEC_APP_10034` firmware as well as the downgraded `10019`. That means a 521d on stock firmware often needs no flashing at all. `--legacy-driver` switches to [`infinytum/libfprint`](https://github.com/infinytum/libfprint), which is what the AUR package `libfprint-goodix-521d` builds from — libfprint 1.94.1, last updated in 2021, and it only accepts `10019`.
 
+One patch is applied to that fork before building: its 52XD driver ships the TLS pre-shared key for `10034` but not for `10019`, so a reader on `10019` opens fine and then fails every enroll with `Goodix TLS PSK is not configured`. The `10019` key is 32 zero bytes — the value `goodix-fp-dump` writes to the sensor, and the one whose sha256 is the driver's own `goodix_52xd_pmk_hash_10019` — so the script puts it back.
+
 **Windows broke the reader again?** The script installs `goodix-fp-fix`; just run `sudo goodix-fp-fix`.
 
 Everything is still experimental. Read the warning in the next section — it applies just as much to the automated path.

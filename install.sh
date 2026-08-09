@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.3"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1021,11 +1021,75 @@ meson_has_option() {
     grep -qE "^[[:space:]]*option\([[:space:]]*'${name}'" "$optfile"
 }
 
+# The 52XD driver carries the TLS PSK for the stock 10034 firmware but not for
+# the 10019 firmware this script flashes, even though it knows 10019's PMK hash
+# and verifies the sensor against it. A reader on 10019 therefore activates
+# cleanly and then dies at the handshake with "Goodix TLS PSK is not
+# configured". The missing PSK is 32 zero bytes: goodix-fp-dump writes exactly
+# that (driver_52xd.py PSK) and feeds it to `openssl s_server -psk` for its own
+# handshake, and sha256 of it is the driver's own goodix_52xd_pmk_hash_10019.
+#
+# sync_repo() checks out --force, so this is re-applied on every run.
+patch_libfprint_52xd_psk() {
+    local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
+
+    [[ -f "$file" ]] || return 0
+    if grep -q 'psk_10019' "$file"; then
+        dbg "goodix52xd.c already supplies the 10019 PSK."
+        return 0
+    fi
+
+    if python3 - "$file" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+
+old = """  if (!self->firmware_10034)
+    {
+      if (length)
+        *length = 0;
+      return NULL;
+    }
+"""
+
+new = """  if (!self->firmware_10034)
+    {
+      /* The 10019 firmware uses an all-zero PSK. goodix-fp-dump writes it, and
+         sha256 of it is goodix_52xd_pmk_hash_10019 above. Patched in by
+         goodix-fp-setup. */
+      static const guint8 psk_10019[32] = { 0 };
+
+      if (length)
+        *length = sizeof (psk_10019);
+
+      return psk_10019;
+    }
+"""
+
+if source.count(old) != 1:
+    sys.exit(1)
+
+with open(path, "w") as handle:
+    handle.write(source.replace(old, new))
+PYEOF
+    then
+        ok "Gave the 52XD driver its 10019 TLS PSK."
+    else
+        warn "Could not patch the 10019 TLS PSK into goodix52xd.c — the driver may have changed."
+        warn "If enrolling fails with 'Goodix TLS PSK is not configured', report it at"
+        warn "https://github.com/yesrab/goodix-521d-explanation/issues"
+    fi
+}
+
 build_libfprint() {
     step "Building patched libfprint"
 
     local src="$SRC_DIR/libfprint" build="$SRC_DIR/libfprint/build-goodix"
     rm -rf "$build"
+
+    patch_libfprint_52xd_psk "$src"
 
     local optfile="" candidate
     for candidate in meson_options.txt meson.options; do
