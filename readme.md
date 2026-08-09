@@ -36,6 +36,12 @@ One patch is applied to that fork before building: its 52XD driver ships the TLS
 
 **Windows broke the reader again?** The script installs `goodix-fp-fix`; just run `sudo goodix-fp-fix`.
 
+**Something not working?** `debug.sh` collects everything needed to diagnose it — device and firmware state, the built library, OpenSSL's security level, fprintd's journal, and two capture tests run against the reader with full driver debugging on. It changes nothing, and prints a report you can paste into an issue or the Discord.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/debug.sh | sudo bash
+```
+
 Everything is still experimental. Read the warning in the next section — it applies just as much to the automated path.
 
 ---
