@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1365,6 +1365,27 @@ PYEOF
     fi
 }
 
+# Prints the part of a failed build that actually says what went wrong. ninja
+# ends with a summary of its own, so the real diagnostics are the compiler lines
+# above it; show those rather than the last 40 lines of progress output.
+show_build_failure() {
+    local clog="$1"
+
+    err "libfprint failed to build. The compiler said:"
+    printf '\n'
+    if grep -nE "error:|Error [0-9]|FAILED:|fatal error" "$clog" >/dev/null 2>&1; then
+        grep -E -B2 -A6 "error:|fatal error|FAILED:" "$clog" | tail -n 60
+    else
+        tail -n 40 "$clog"
+    fi
+    printf '\n'
+    if (( SIGFM )); then
+        err "This build used --sigfm, which is experimental. Re-run without it to get a"
+        err "working reader, and please report the errors above."
+    fi
+    die "Full build log: $clog (also copied into $LOG_FILE)"
+}
+
 build_libfprint() {
     step "Building patched libfprint"
 
@@ -1421,19 +1442,21 @@ build_libfprint() {
     "$MESON_BIN" setup "$build" "$src" "${opts[@]}" >/dev/null \
         || { tail -n 40 "$build/meson-logs/meson-log.txt" 2>/dev/null || true; die "meson setup failed."; }
 
+    # meson prints compiler errors on stdout, not stderr, so both streams have to
+    # be captured or a failed build reports nothing at all.
+    local clog="$build/compile.log"
+
     info "Compiling (this takes a minute or two)"
-    if ! "$MESON_BIN" compile -C "$build" >/dev/null 2>"$build/compile.err"; then
+    if ! "$MESON_BIN" compile -C "$build" >"$clog" 2>&1; then
         warn "Build failed; retrying with the compatibility patch applied to meson.build."
         if grep -q "common_cflags = cc.get_supported_arguments(\[" "$src/meson.build" \
            && ! grep -q "Wno-incompatible-pointer-types" "$src/meson.build"; then
             sed -i "/common_cflags = cc.get_supported_arguments(\[/a \    '-Wno-incompatible-pointer-types'," "$src/meson.build"
             rm -rf "$build"
             "$MESON_BIN" setup "$build" "$src" "${opts[@]}" >/dev/null || die "meson setup failed after patching."
-            "$MESON_BIN" compile -C "$build" >/dev/null 2>"$build/compile.err" \
-                || { tail -n 40 "$build/compile.err"; die "libfprint failed to build."; }
+            "$MESON_BIN" compile -C "$build" >"$clog" 2>&1 || show_build_failure "$clog"
         else
-            tail -n 40 "$build/compile.err"
-            die "libfprint failed to build."
+            show_build_failure "$clog"
         fi
     fi
 

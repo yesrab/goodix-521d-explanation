@@ -175,13 +175,28 @@ about if you ever re-derive it:
 clone both repos, apply `sigfm-core.patch` with `--reject`, then `port.py`
 applies 13 anchored edits and fails loudly if any anchor is missing.
 
-**Verification status.** No compiler on this machine can build libfprint
-(needs gudev/udev). What *was* checked: the patch applies clean to pristine
-1.94.10; the new SIGFM C block compiles with `-Wall -Wextra` against real glib
-with stubbed libfprint types; `sigfm.cpp` compiles clean against OpenCV 5.0 (so
-its API use is stable 4.5→5.0); all 7 `sigfm_*` functions are declared, defined
-and `extern "C"`; all five install-time patches are idempotent across runs.
-**Never compiled as a whole, never run.**
+**Do not trust the `.rej` files to tell you what did *not* apply.** `fp-image.c`
+has **six** hunks and the sixth — the public `fp_image_get_sigfm_info()` /
+`fp_image_extract_sigfm_info()` definitions — lands cleanly on 1.94.10 while the
+other five reject. Reading only the reject and re-adding those two functions
+produced `error: redefinition of 'fp_image_get_sigfm_info'` on the first real
+build. Count hunks (`grep -c '^@@'` over that file's slice of the patch) against
+rejects before assuming a file is untouched.
+
+**Local compile check.** `scratchpad/check.sh` syntax-checks the five patched
+core files with Ubuntu's flags (`-std=gnu99 -Wall -Werror=implicit …`). It works
+because `mkenums.py` fakes meson's `gnome.mkenums_simple()` output and
+`stub/{config.h,gusb.h}` stand in for the Linux-only pieces; `fpi-image.c` is
+excluded since the port does not touch it and it needs pixman. Run it after any
+change to the port — it catches redefinitions, missing declarations and enum
+mismatches, which is most of what goes wrong here.
+
+**Verification status.** libfprint as a whole cannot be built on this machine
+(gudev/udev). What *is* checked: the patch applies clean to pristine 1.94.10 and
+the result passes `check.sh`; `sigfm.cpp` compiles clean against OpenCV 5.0 (its
+API use is stable 4.5→5.0); all 7 `sigfm_*` functions are declared, defined and
+`extern "C"`; the five install-time patches are idempotent. **The link step and
+runtime behaviour are still unverified.**
 
 ## Conventions
 
