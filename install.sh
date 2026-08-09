@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.0.4"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1083,6 +1083,73 @@ PYEOF
     fi
 }
 
+# After each capture the 52XD driver polls frames until one looks like an empty
+# sensor, and only then accepts the next finger. goodix52xd_frame_is_empty()
+# calls a frame empty on either of two rules:
+#
+#   A  mean in [1900,2200] and high_pixels <= 16      (a quiet, unlit sensor)
+#   B  mean >= 4000 and high_pixels >= 5100           (a saturated sensor)
+#
+# Rule B cannot fire on at least some 521d units. The frame is 64x80 = 5120
+# pixels, but ~284 of them never rise above the 2800 "high" threshold, so
+# high_pixels saturates at 4836 and can never reach 5100. Their saturated
+# frames also read mean ~3905, just under 4000. With rule B unreachable the
+# driver falls back to rule A alone, whose window such a sensor only wanders
+# into every few seconds — the reader appears to hang for tens of seconds, or
+# minutes, between enroll stages.
+#
+# The replacements sit in the gap the hardware actually leaves. On the reader
+# this was measured from, frames cluster into "saturated" (mean 3757-3905,
+# high 4627-4836) and "in between" (mean <= 3566, high <= 4217); 3600/4500
+# separates them cleanly. Set GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS=1 to skip
+# this and build the driver's own values.
+#
+# sync_repo() checks out --force, so this is re-applied on every run.
+patch_libfprint_52xd_finger_off() {
+    local file="$1/libfprint/drivers/goodixtls/goodix52xd_proto.h"
+
+    [[ -f "$file" ]] || return 0
+    if [[ -n "${GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS:-}" ]]; then
+        info "Keeping the driver's own empty-frame thresholds."
+        return 0
+    fi
+    if grep -q 'goodix-fp-setup' "$file"; then
+        dbg "goodix52xd_proto.h thresholds already adjusted."
+        return 0
+    fi
+
+    if python3 - "$file" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+
+old = """#define GOODIX52XD_EMPTY_SATURATED_MEAN_MIN 4000
+#define GOODIX52XD_EMPTY_SATURATED_HIGH_PIXEL_MIN 5100
+"""
+
+new = """/* Lowered by goodix-fp-setup: high_pixels tops out at 4836 on real 521d
+   sensors (5120 pixels, ~284 of which never cross the high threshold), so
+   the stock 5100 could never match and finger-off detection stalled. */
+#define GOODIX52XD_EMPTY_SATURATED_MEAN_MIN 3600
+#define GOODIX52XD_EMPTY_SATURATED_HIGH_PIXEL_MIN 4500
+"""
+
+if source.count(old) != 1:
+    sys.exit(1)
+
+with open(path, "w") as handle:
+    handle.write(source.replace(old, new))
+PYEOF
+    then
+        ok "Adjusted the 52XD empty-frame thresholds so finger-off is detected."
+    else
+        warn "Could not adjust goodix52xd_proto.h — the driver may have changed."
+        warn "Enrolling will still work but may pause a long time between scans."
+    fi
+}
+
 build_libfprint() {
     step "Building patched libfprint"
 
@@ -1090,6 +1157,7 @@ build_libfprint() {
     rm -rf "$build"
 
     patch_libfprint_52xd_psk "$src"
+    patch_libfprint_52xd_finger_off "$src"
 
     local optfile="" candidate
     for candidate in meson_options.txt meson.options; do
