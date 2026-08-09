@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 
 # ---------------------------------------------------------------------------
 # Paths — must match install.sh
@@ -126,6 +126,19 @@ runsh() {
 }
 
 note() { { printf '\n[note] %s\n' "$*"; } >>"$REPORT"; }
+
+# Diagnostics must survive a broken system: a section that fails is recorded
+# and skipped, never fatal. Calling through this also relaxes `set -e` inside
+# the section, so one bad command doesn't discard the rest of it.
+guard() {
+    local rc=0
+    "$@" || rc=$?
+    if (( rc )); then
+        note "section '$1' stopped early (exit $rc); everything else still ran."
+        warn "Section '$1' failed (exit $rc); continuing."
+    fi
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -324,7 +337,13 @@ collect_firmware_probe() {
 
     PROBE_FIRMWARE="$(sed -n 's/^GFP_FIRMWARE=//p' <<<"$out" | tail -n1)"
     PROBE_PSK="$(sed -n 's/^GFP_PSK_VALID=//p' <<<"$out" | tail -n1)"
-    [[ -n "$PROBE_FIRMWARE" ]] && info "Firmware: $PROBE_FIRMWARE (PSK valid: ${PROBE_PSK:-?})"
+
+    if [[ -n "$PROBE_FIRMWARE" ]]; then
+        info "Firmware: $PROBE_FIRMWARE (PSK valid: ${PROBE_PSK:-?})"
+    else
+        warn "The probe reported no firmware (exit $rc); the report has its output."
+    fi
+    return 0
 }
 
 # The main event: libfprint's own enroll, with every driver message on.
@@ -458,19 +477,19 @@ main() {
     fi
 
     step "Collecting state"
-    collect_header
-    collect_hardware
-    collect_install_state
-    collect_openssl
-    collect_fprintd
+    guard collect_header
+    guard collect_hardware
+    guard collect_install_state
+    guard collect_openssl
+    guard collect_fprintd
 
     if (( DO_CAPTURE )); then
         step "Testing the reader"
         info "Stopping fprintd so it releases the device"
         hold_fprintd
-        collect_firmware_probe
-        capture_libfprint
-        capture_fpdump
+        guard collect_firmware_probe
+        guard capture_libfprint
+        guard capture_fpdump
         release_fprintd
         ok "fprintd restarted."
     else
@@ -478,7 +497,7 @@ main() {
         note "Capture tests were skipped with --no-capture."
     fi
 
-    collect_tail
+    guard collect_tail
 
     chmod 0644 "$REPORT" 2>/dev/null || true
 
