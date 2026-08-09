@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths — must match install.sh
@@ -329,6 +329,26 @@ collect_install_state() {
     else
         rep "(no libfprint checkout at $drv)"
     fi
+
+    # Which matcher the built library actually uses. The scores further down mean
+    # different things depending on the answer, so establish it up front.
+    sec "Matcher in use"
+    if [[ -f "$drv" ]]; then
+        if grep -q 'FPI_DEVICE_ALGO_SIGFM' "$drv"; then
+            rep "SIGFM (SIFT) — built with install.sh --sigfm."
+            if [[ -d "$SRC_DIR/libfprint/libfprint/sigfm" ]]; then
+                rep "SIGFM sources present."
+            else
+                rep "WARNING: the driver selects SIGFM but libfprint/sigfm/ is missing."
+            fi
+            runsh "SIGFM keypoint minimum" "grep -n -A3 'SIGFM_MIN_KEYPOINTS' '$SRC_DIR/libfprint/libfprint/fp-image.c' 2>/dev/null | head -20"
+            runsh "opencv4" "pkg-config --modversion opencv4 2>/dev/null || echo '(opencv4 not found)'"
+        else
+            rep "NBIS (libfprint default)."
+        fi
+        runsh "score threshold" "grep -n 'bz3_threshold =' '$drv'"
+    fi
+    return 0
 }
 
 collect_openssl() {

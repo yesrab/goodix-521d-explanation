@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -57,6 +57,15 @@ LIBFPRINT_REF="${GOODIX_LIBFPRINT_REF:-master}"
 readonly LEGACY_LIBFPRINT_REPO="https://github.com/infinytum/libfprint.git"
 readonly LEGACY_LIBFPRINT_REF="unstable"
 
+# SIGFM: a SIFT-based matcher meant for low-resolution sensors, ported here from
+# goodix-fp-linux-dev/libfprint@sigfm onto djnz00's 1.94.10. The patch is a
+# rebase, not a copy — see patches/ and the readme. Because it is a rebase it is
+# pinned to the commit it was generated against; --sigfm ignores
+# GOODIX_LIBFPRINT_REF unless you override this too.
+readonly SIGFM_PATCH_NAME="sigfm-libfprint-1.94.10.patch"
+SIGFM_PATCH_URL="${GOODIX_SIGFM_PATCH_URL:-https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/patches/$SIGFM_PATCH_NAME}"
+SIGFM_LIBFPRINT_REF="${GOODIX_SIGFM_LIBFPRINT_REF:-72cacc37ca6524390a112e7df7bf2c6972be8217}"
+
 readonly GOODIX_VID="27c6"
 # Overridable so the detection logic can be exercised against a fake tree.
 SYSFS_USB="${GOODIX_SYSFS_USB:-/sys/bus/usb/devices}"
@@ -70,6 +79,7 @@ DO_FLASH=1
 DO_DRIVER=1
 FORCE_FLASH=0
 LEGACY_DRIVER=0
+SIGFM=0
 GLOBAL_LIB=0
 SETUP_PAM=0
 SKIP_DEPS=0
@@ -100,6 +110,7 @@ TTY_FD_OPEN=0
 MESON_BIN="meson"
 FLASH_PERFORMED=0
 FLASH_SKIPPED_REASON=""
+SIGFM_PATCH_FILE=""
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -188,6 +199,10 @@ Options:
       --force-flash     Flash even when the current firmware is already supported.
       --legacy-driver   Build the older infinytum libfprint fork (1.94.1) instead
                         of the maintained one (1.94.10).
+      --sigfm           Match with SIGFM (SIFT) instead of NBIS. Experimental; for
+                        readers where a wrong finger verifies. Needs OpenCV >= 4.5,
+                        pins libfprint to the commit the port targets, and makes
+                        existing enrollments unreadable — you must re-enroll.
       --global-lib      Register the patched libfprint in /etc/ld.so.conf.d instead
                         of scoping it to fprintd. Only needed without systemd.
       --pam             Also enable fingerprint login via your distro's PAM tool.
@@ -216,6 +231,7 @@ parse_args() {
             --driver-only)   DO_FLASH=0 ;;
             --force-flash)   FORCE_FLASH=1 ;;
             --legacy-driver) LEGACY_DRIVER=1 ;;
+            --sigfm)         SIGFM=1 ;;
             --global-lib)    GLOBAL_LIB=1 ;;
             --pam)           SETUP_PAM=1 ;;
             --skip-deps)     SKIP_DEPS=1 ;;
@@ -233,6 +249,13 @@ parse_args() {
     if (( LEGACY_DRIVER )); then
         LIBFPRINT_REPO="${GOODIX_LIBFPRINT_REPO:-$LEGACY_LIBFPRINT_REPO}"
         LIBFPRINT_REF="${GOODIX_LIBFPRINT_REF:-$LEGACY_LIBFPRINT_REF}"
+    fi
+
+    if (( SIGFM )); then
+        (( LEGACY_DRIVER )) && die "--sigfm and --legacy-driver are mutually exclusive: the port targets 1.94.10."
+        # The port is a rebase against one commit, so master moving would break
+        # it in ways that look like a compiler error rather than a version skew.
+        LIBFPRINT_REF="$SIGFM_LIBFPRINT_REF"
     fi
 }
 
@@ -294,18 +317,25 @@ detect_os() {
 # ---------------------------------------------------------------------------
 
 pkg_list() {
+    # SIGFM is C++ and needs OpenCV's development headers; NBIS builds need
+    # neither, so they are only pulled in for --sigfm.
+    local sigfm_pkgs=""
     case "$PKG_MGR" in
         pacman)
-            echo "python git curl base-devel meson ninja pkgconf glib2 glib2-devel libgusb libgudev openssl pixman nss libusb systemd-libs fprintd"
+            (( SIGFM )) && sigfm_pkgs=" opencv"
+            echo "python git curl base-devel meson ninja pkgconf glib2 glib2-devel libgusb libgudev openssl pixman nss libusb systemd-libs fprintd$sigfm_pkgs"
             ;;
         apt)
-            echo "python3 python3-venv python3-dev python3-pip build-essential git curl meson ninja-build pkg-config libglib2.0-dev libgusb-dev libgudev-1.0-dev libssl-dev libpixman-1-dev libnss3-dev libusb-1.0-0-dev libsystemd-dev openssl fprintd"
+            (( SIGFM )) && sigfm_pkgs=" libopencv-dev"
+            echo "python3 python3-venv python3-dev python3-pip build-essential git curl meson ninja-build pkg-config libglib2.0-dev libgusb-dev libgudev-1.0-dev libssl-dev libpixman-1-dev libnss3-dev libusb-1.0-0-dev libsystemd-dev openssl fprintd$sigfm_pkgs"
             ;;
         dnf|yum)
-            echo "python3 python3-devel gcc make git curl meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel libgudev-devel openssl-devel pixman-devel nss-devel libusb1-devel systemd-devel openssl fprintd"
+            (( SIGFM )) && sigfm_pkgs=" gcc-c++ opencv-devel"
+            echo "python3 python3-devel gcc make git curl meson ninja-build pkgconf-pkg-config glib2-devel libgusb-devel libgudev-devel openssl-devel pixman-devel nss-devel libusb1-devel systemd-devel openssl fprintd$sigfm_pkgs"
             ;;
         zypper)
-            echo "python3 python3-devel python3-pip gcc make git curl meson ninja pkg-config glib2-devel libgusb-devel libgudev-1_0-devel libopenssl-devel libpixman-1-0-devel mozilla-nss-devel libusb-1_0-devel systemd-devel openssl fprintd"
+            (( SIGFM )) && sigfm_pkgs=" gcc-c++ opencv-devel"
+            echo "python3 python3-devel python3-pip gcc make git curl meson ninja pkg-config glib2-devel libgusb-devel libgudev-1_0-devel libopenssl-devel libpixman-1-0-devel mozilla-nss-devel libusb-1_0-devel systemd-devel openssl fprintd$sigfm_pkgs"
             ;;
         *) echo "" ;;
     esac
@@ -373,16 +403,31 @@ preflight() {
     fi
 
     local pcbin="pkg-config"; have pkg-config || pcbin="pkgconf"
-    local mod
-    for mod in "glib-2.0 >= 2.68" "gio-unix-2.0" "gobject-2.0" "gusb >= 0.2.0" "openssl" "pixman-1" "gudev-1.0"; do
+    local mod mods=("glib-2.0 >= 2.68" "gio-unix-2.0" "gobject-2.0" "gusb >= 0.2.0" "openssl" "pixman-1" "gudev-1.0")
+
+    if (( SIGFM )); then
+        have c++ || have g++ || missing_bin+=("g++")
+        mods+=("opencv4 >= 4.5.0")
+    fi
+
+    for mod in "${mods[@]}"; do
         # shellcheck disable=SC2086
         if ! "$pcbin" --exists $mod 2>/dev/null; then
             missing_pc+=("$mod")
         fi
     done
 
+    if (( ${#missing_bin[@]} )); then
+        err "Missing required programs: ${missing_bin[*]}"
+        die "Install them with your package manager, then re-run with --skip-deps."
+    fi
+
     if (( ${#missing_pc[@]} )); then
         err "Missing development libraries (pkg-config): ${missing_pc[*]}"
+        if printf '%s\n' "${missing_pc[@]}" | grep -q 'opencv4'; then
+            err "--sigfm needs OpenCV >= 4.5 development files (libopencv-dev / opencv-devel)."
+            err "Note it is the 'opencv4' pkg-config module specifically; OpenCV 5 ships 'opencv5'."
+        fi
         if printf '%s\n' "${missing_pc[@]}" | grep -q 'glib-2.0'; then
             err "libfprint needs glib >= 2.68. Very old releases (Debian 11, Ubuntu 20.04) cannot build this."
         fi
@@ -812,6 +857,31 @@ sync_repo() {
     dbg "$dest is at $(git -C "$dest" rev-parse --short HEAD)"
 }
 
+# The SIGFM port is a real patch file rather than an inline heredoc so it can be
+# reviewed and reapplied by hand. Prefer a copy sitting next to the script (a
+# git clone of this repo) and fall back to downloading it.
+locate_sigfm_patch() {
+    local candidate here=""
+
+    [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for candidate in "${GOODIX_SIGFM_PATCH_FILE:-}" \
+                     ${here:+"$here/patches/$SIGFM_PATCH_NAME"} \
+                     "$PWD/patches/$SIGFM_PATCH_NAME"; do
+        if [[ -n "$candidate" && -f "$candidate" ]]; then
+            SIGFM_PATCH_FILE="$candidate"
+            info "Using local patch $candidate"
+            return 0
+        fi
+    done
+
+    SIGFM_PATCH_FILE="$SRC_DIR/$SIGFM_PATCH_NAME"
+    info "Downloading $SIGFM_PATCH_NAME"
+    curl -fsSL "$SIGFM_PATCH_URL" -o "$SIGFM_PATCH_FILE" \
+        || die "Could not download the SIGFM patch from $SIGFM_PATCH_URL"
+    [[ -s "$SIGFM_PATCH_FILE" ]] || die "The downloaded SIGFM patch is empty."
+    return 0
+}
+
 fetch_sources() {
     step "Fetching sources"
     mkdir -p "$SRC_DIR"
@@ -828,7 +898,9 @@ fetch_sources() {
         sync_repo "$LIBFPRINT_REPO" "$LIBFPRINT_REF" "$SRC_DIR/libfprint" 0
         [[ -d "$SRC_DIR/libfprint/libfprint/drivers/goodixtls" ]] || die "That libfprint checkout has no goodixtls drivers."
         ok "libfprint ready ($(grep -m1 -oE "version: *'[^']+'" "$SRC_DIR/libfprint/meson.build" | grep -oE "[0-9.]+"))."
+        (( SIGFM )) && locate_sigfm_patch
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1168,11 +1240,21 @@ PYEOF
 # sync_repo() checks out --force, so this is re-applied on every run.
 patch_libfprint_52xd_bz3() {
     local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
-    local want="${GOODIX_BZ3_THRESHOLD:-40}"
+    local want envname="GOODIX_BZ3_THRESHOLD"
+
+    # Under --sigfm this same field is the SIGFM score threshold, which counts
+    # agreeing keypoint-pair geometries rather than bozorth3 points — a totally
+    # different scale, so it gets its own knob.
+    if (( SIGFM )); then
+        envname="GOODIX_SIGFM_THRESHOLD"
+        want="${GOODIX_SIGFM_THRESHOLD:-${GOODIX_BZ3_THRESHOLD:-40}}"
+    else
+        want="${GOODIX_BZ3_THRESHOLD:-40}"
+    fi
 
     [[ -f "$file" ]] || return 0
     if [[ ! "$want" =~ ^[0-9]+$ ]]; then
-        warn "GOODIX_BZ3_THRESHOLD='$want' is not a number; leaving the driver's own value."
+        warn "$envname='$want' is not a number; leaving the driver's own value."
         return 0
     fi
     if grep -q 'bz3-threshold' "$file"; then
@@ -1203,13 +1285,83 @@ with open(path, "w") as handle:
     handle.write(source.replace(old, new))
 PYEOF
     then
-        ok "Raised the 52XD match threshold to $want (driver ships 24)."
-        if (( want < 40 )); then
-            warn "$want is below libfprint's default of 40; unrelated fingers may still match."
+        if (( SIGFM )); then
+            ok "Set the 52XD SIGFM score threshold to $want."
+            warn "That number is a guess until you measure it: run debug.sh --match-test"
+            warn "and set $envname to sit in the gap between your two score groups."
+        else
+            ok "Raised the 52XD match threshold to $want (driver ships 24)."
+            if (( want < 40 )); then
+                warn "$want is below libfprint's default of 40; unrelated fingers may still match."
+            fi
         fi
     else
         warn "Could not adjust the 52XD match threshold — the driver may have changed."
         warn "Do not use fingerprint login until you have verified a wrong finger is rejected."
+    fi
+}
+
+# Grafts SIGFM onto the tree. The patch adds libfprint/sigfm/ and rebases the
+# core matcher hooks from goodix-fp-linux-dev/libfprint@sigfm (libfprint 1.94.5)
+# onto 1.94.10. sync_repo() checks out --force, so this reapplies every run.
+apply_sigfm_patch() {
+    local src="$1"
+
+    [[ -n "$SIGFM_PATCH_FILE" ]] || die "The SIGFM patch was never located."
+
+    if [[ -d "$src/libfprint/sigfm" ]]; then
+        dbg "SIGFM sources already present."
+        return 0
+    fi
+
+    if ! git -C "$src" apply --whitespace=nowarn "$SIGFM_PATCH_FILE"; then
+        err "The SIGFM patch did not apply to this libfprint checkout."
+        err "It is pinned to $SIGFM_LIBFPRINT_REF; HEAD is $(git -C "$src" rev-parse --short HEAD)."
+        die "Re-run without --sigfm, or report this with the log at $LOG_FILE."
+    fi
+    ok "Applied the SIGFM port ($(grep -c '^diff --git' "$SIGFM_PATCH_FILE") files)."
+    return 0
+}
+
+# Opts the 52XD driver into the SIGFM matcher. Nothing else changes matcher, so
+# every other driver keeps NBIS.
+patch_libfprint_52xd_sigfm() {
+    local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
+
+    [[ -f "$file" ]] || return 0
+    if grep -q 'FPI_DEVICE_ALGO_SIGFM' "$file"; then
+        dbg "goodix52xd.c already selects SIGFM."
+        return 0
+    fi
+
+    if python3 - "$file" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+
+old = "  dev_class->scan_type = FP_SCAN_TYPE_PRESS;\n"
+
+new = """  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+
+  /* Selected by goodix-fp-setup --sigfm. NBIS finds too few minutiae in this
+     sensor's 64x80 frames to tell fingers apart; SIGFM matches SIFT keypoints
+     instead. bz3_threshold below is reused as the SIGFM score threshold, and
+     the two are on completely different scales. */
+  img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+"""
+
+if source.count(old) != 1:
+    sys.exit(1)
+
+with open(path, "w") as handle:
+    handle.write(source.replace(old, new))
+PYEOF
+    then
+        ok "Switched the 52XD driver to the SIGFM matcher."
+    else
+        die "Could not switch the 52XD driver to SIGFM — the driver has changed."
     fi
 }
 
@@ -1218,6 +1370,11 @@ build_libfprint() {
 
     local src="$SRC_DIR/libfprint" build="$SRC_DIR/libfprint/build-goodix"
     rm -rf "$build"
+
+    if (( SIGFM )); then
+        apply_sigfm_patch "$src"
+        patch_libfprint_52xd_sigfm "$src"
+    fi
 
     patch_libfprint_52xd_psk "$src"
     patch_libfprint_52xd_finger_off "$src"
@@ -1228,13 +1385,25 @@ build_libfprint() {
         if [[ -f "$src/$candidate" ]]; then optfile="$src/$candidate"; break; fi
     done
 
+    # GCC 14+ turns incompatible-pointer-types into an error; these forks
+    # predate that. Same workaround the AUR package applies.
+    local cargs="-Wno-incompatible-pointer-types"
+
+    if (( SIGFM )); then
+        # SIFT on a 64x80 sensor yields far fewer keypoints than the port's
+        # upstream default of 25 assumes. Lower this if every scan fails with
+        # "Not enough keypoints found".
+        local minkp="${GOODIX_SIGFM_MIN_KEYPOINTS:-25}"
+        [[ "$minkp" =~ ^[0-9]+$ ]] || die "GOODIX_SIGFM_MIN_KEYPOINTS must be a number."
+        cargs+=" -DSIGFM_MIN_KEYPOINTS=$minkp"
+        info "SIGFM minimum keypoints: $minkp"
+    fi
+
     local opts=(
         --prefix="$PREFIX"
         --libdir=lib
         --buildtype=release
-        # GCC 14+ turns incompatible-pointer-types into an error; these forks
-        # predate that. Same workaround the AUR package applies.
-        -Dc_args=-Wno-incompatible-pointer-types
+        -Dc_args="$cargs"
     )
 
     # Trim the build down to what fprintd actually needs, and keep every
@@ -1510,6 +1679,11 @@ print_plan() {
     fi
     if (( DO_DRIVER )); then
         info "libfprint       : build $LIBFPRINT_REPO@$LIBFPRINT_REF into $PREFIX"
+        if (( SIGFM )); then
+            info "Matcher         : SIGFM (SIFT) — experimental, re-enrolment required"
+        else
+            info "Matcher         : NBIS (libfprint default)"
+        fi
         info "fprintd         : install from your distro and point it at that build"
     else
         info "libfprint       : skipped"

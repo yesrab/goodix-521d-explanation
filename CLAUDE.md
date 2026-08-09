@@ -133,6 +133,56 @@ Three invariants that must survive edits:
 `fprintd` is stopped and masked for the duration and restored by a
 `trap on_exit EXIT INT TERM`.
 
+## The SIGFM port
+
+`patches/sigfm-libfprint-1.94.10.patch` (15 files, ~950 insertions) grafts SIGFM
+onto djnz00's tree. Applied only by `--sigfm`; the default build is untouched.
+
+**Provenance.** SIGFM's core comes from `goodix-fp-linux-dev/libfprint@sigfm`
+(libfprint **1.94.5**). Extract the upstream diff with
+`git diff v1.94.5 HEAD -- <files>` against the `v1.94.5` tag fetched from
+`gitlab.freedesktop.org/libfprint/libfprint`. Do **not** blanket-diff the branch:
+it also carries an unrelated `fp-device`/`fpi-device` refactor and a
+`HAVE_PIXMAN` change that must not be taken. 7 of 9 core files apply cleanly to
+1.94.10; `fp-image.c` and `fpi-image.h` reject on whitespace churn only.
+
+**The patch is pinned** to `djnz00/libfprint@72cacc37ca6524390a112e7df7bf2c6972be8217`
+because it is a rebase — `--sigfm` overrides `LIBFPRINT_REF` for that reason. If
+djnz00 moves and you regenerate, the pin in install.sh must move with it.
+
+**Architecture.** Opt-in per driver: `FpImageDeviceClass.algorithm`
+(`FPI_DEVICE_ALGO_NBIS` / `_SIGFM`), defaulted to NBIS in
+`fp_image_device_constructed()`. `fpi-image-device.c` branches to
+`fp_image_extract_sigfm_info()` / `fpi_print_sigfm_match()`. Only goodix52xd is
+switched over, by `patch_libfprint_52xd_sigfm()`. `bz3_threshold` is reused as
+the SIGFM threshold, but SIGFM's score counts agreeing keypoint-pair geometries —
+a different scale entirely, hence `GOODIX_SIGFM_THRESHOLD`.
+
+**Four defects in the upstream branch are fixed in our patch** — worth knowing
+about if you ever re-derive it:
+1. `fp_print_serialize()` called `g_clear_object()` on a `GPtrArray`. Replaced
+   with `g_autoptr(GPtrArray)` + `g_ptr_array_new_with_free_func (free)` —
+   `free`, because `binary.hpp`'s `copy_buffer()` uses `malloc`.
+2. `fp_image_finalize()` never freed `sigfm_info` — a leaked OpenCV `Mat` plus
+   keypoint vector on every single scan.
+3. Verify left `FpiMatchResult result` uninitialised when `algorithm` was
+   neither value — unreachable now, but it decided an auth result.
+4. The branch put `#include "sigfm/sigfm.hpp"` in the *installed* `fp-image.h`.
+   Both new functions are internal, so they were moved to `fpi-image.h`; this
+   also means `fpi-image-device.c` needs an explicit `#include "fpi-image.h"`.
+
+**Regenerating.** `scratchpad/build-port.sh` + `port.py` rebuild it from clean:
+clone both repos, apply `sigfm-core.patch` with `--reject`, then `port.py`
+applies 13 anchored edits and fails loudly if any anchor is missing.
+
+**Verification status.** No compiler on this machine can build libfprint
+(needs gudev/udev). What *was* checked: the patch applies clean to pristine
+1.94.10; the new SIGFM C block compiles with `-Wall -Wextra` against real glib
+with stubbed libfprint types; `sigfm.cpp` compiles clean against OpenCV 5.0 (so
+its API use is stable 4.5→5.0); all 7 `sigfm_*` functions are declared, defined
+and `extern "C"`; all five install-time patches are idempotent across runs.
+**Never compiled as a whole, never run.**
+
 ## Conventions
 
 - Bash, `set -Eeuo pipefail`, functions only, `main` at the bottom.
@@ -160,7 +210,8 @@ Three invariants that must survive edits:
 - **False accepts are unresolved.** See "The false-accept problem" above. The
   threshold bump is a mitigation, not a fix. Waiting on `--match-test` numbers
   from the user's reader to know whether the score distributions overlap.
-- **SIGFM** (`goodix-fp-linux-dev/sigfm`) is the right answer to that: a SIFT matcher
+- **`--sigfm` is built but unverified on hardware.** See "The SIGFM port" below.
+- **SIGFM background** (`goodix-fp-linux-dev/sigfm`): a SIFT matcher
   written specifically for 64×80 sensors. **Not usable today** — no published branch
   combines `libfprint/sigfm/` with the goodixtls 52xd driver. The org's `sigfm`
   branches carry only `goodixmoc`; its `goodixtls` branch carries only `goodix511`.

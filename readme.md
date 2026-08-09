@@ -25,6 +25,7 @@ Useful flags (`... | sudo bash -s -- --flag`):
 | `--flash-only` / `--driver-only` | Run only one half of the process. |
 | `--force-flash` | Downgrade even when the current firmware is already usable. |
 | `--legacy-driver` | Build the older libfprint fork the AUR package uses (see below). |
+| `--sigfm` | Match with SIGFM (SIFT) instead of NBIS. Experimental — see below. |
 | `--pam` | Also enable fingerprint login through your distro's PAM tool. |
 | `--uninstall` | Remove everything the script installed. |
 
@@ -51,6 +52,37 @@ curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main
 That enrolls a finger into a scratch directory, asks you to scan the same finger and then a different one, and prints the match score of every attempt alongside an ASCII rendering of each captured image. If a finger you never enrolled reaches the threshold, the report says so in as many words. Nothing is written to your account and the scratch directory is deleted on exit.
 
 If the two groups of scores overlap, no threshold setting can separate them and the reader is not usable for authentication as things stand.
+
+### `--sigfm`: the SIFT matcher
+
+Raising the threshold only helps if NBIS can separate your fingers at all. When it can't, the problem is that NBIS wants minutiae — ridge endings and bifurcations — and a 64×80 frame barely has enough resolution to contain any. [SIGFM](https://github.com/goodix-fp-linux-dev/sigfm) exists for exactly this case: it matches SIFT keypoints instead, and its README says it is *"meant to work with 64x80 images"*.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/install.sh | sudo bash -s -- --driver-only --sigfm
+```
+
+**This is experimental and you should read the whole of this section before using it.**
+
+- **No published branch shipped this.** SIGFM lives on `goodix-fp-linux-dev/libfprint@sigfm`, which is libfprint 1.94.5 and whose only Goodix driver is `goodixmoc` — no goodixtls, so no 521d. No driver on that branch selects SIGFM at all, so this code path had never been exercised before. `patches/sigfm-libfprint-1.94.10.patch` rebases it onto djnz00's 1.94.10 and wires the 52XD driver to it.
+- **Three defects in that branch's code are fixed in the patch**, all of which would bite immediately: serialising a print called `g_clear_object()` on a `GPtrArray`; every scan leaked its `SigfmImgInfo`; and verify could read an uninitialised match result. The patch also keeps `sigfm.hpp` out of the installed public headers, which upstream did not.
+- **Needs OpenCV ≥ 4.5** development files — specifically the `opencv4` pkg-config module; OpenCV 5 ships `opencv5` and will not be found. `--sigfm` adds the right package for your distro automatically.
+- **Existing enrollments stop working.** SIGFM stores SIFT descriptors where NBIS stored minutiae. Delete and re-enroll (`fprintd-delete $USER`, then `fprintd-enroll`). Going back to NBIS means re-enrolling again.
+- **libfprint is pinned.** The patch is a rebase against one commit, so `--sigfm` ignores `GOODIX_LIBFPRINT_REF` and builds `djnz00/libfprint@72cacc37`.
+
+Two numbers need tuning to your hardware, and the defaults are inherited guesses, not measurements:
+
+| Variable | Default | Raise it if… | Lower it if… |
+| --- | --- | --- | --- |
+| `GOODIX_SIGFM_THRESHOLD` | 40 | a wrong finger still verifies | your own finger never verifies |
+| `GOODIX_SIGFM_MIN_KEYPOINTS` | 25 | — | scans fail with `Not enough keypoints found` |
+
+Measure before you change them — `debug.sh --match-test` prints every score, and under SIGFM those are `sigfm score N/M` lines on a completely different scale from bozorth3:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/debug.sh | sudo bash -s -- --match-test
+```
+
+Then rebuild with the threshold sitting in the gap between the two groups, e.g. `... | sudo GOODIX_SIGFM_THRESHOLD=120 bash -s -- --driver-only --sigfm`.
 
 **Windows broke the reader again?** The script installs `goodix-fp-fix`; just run `sudo goodix-fp-fix`.
 
