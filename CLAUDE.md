@@ -5,9 +5,11 @@ The repo is two shell scripts plus the original manual guide.
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | The deliverable. One-shot automated installer, currently **v1.0.4**. |
-| `debug.sh` | One-shot diagnostic collector, currently **v1.0.1**. Read-only. |
+| `install.sh` | The deliverable. One-shot automated installer, currently **v1.2.0**. |
+| `debug.sh` | One-shot diagnostic collector, currently **v1.3.0**. Read-only. |
 | `readme.md` | User-facing docs: automated path first, original manual guide below. |
+| `patches/` | `sigfm-libfprint-1.94.10.patch`, applied only by `--sigfm`. |
+| `tests/` | `run-pipeline-test.sh` + `test_pipeline.c` — see "Testing" below. |
 | `goodix-fp-dump/` | Submodule — the Python firmware flasher from the Goodix Linux Dev Discord. |
 | `usbreset/` | The `usbreset.c` helper referenced by the manual guide. |
 
@@ -66,17 +68,41 @@ Applied in `build_libfprint()` before meson runs. `sync_repo()` does
    (margins 90 and 311). Opt out with `GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS=1`.
    Guard: `grep -q 'goodix-fp-setup'`.
 
-3. **`patch_libfprint_52xd_bz3()`** → `drivers/goodixtls/goodix52xd.c`.
+3. **`patch_libfprint_52xd_background()`** → `drivers/goodixtls/goodix52xd.c`.
+   The root-cause fix for the false accepts, added in v1.2.0. Subtracts an idle
+   frame from every capture before the contrast stretch. Details in
+   "The false-accept problem" below. Knobs:
+   `GOODIX_KEEP_STOCK_IMAGE_PIPELINE=1` opts out entirely,
+   `GOODIX_52XD_STRETCH_CLIP_PERMILLE` (default 20) sets how far into the
+   histogram's tails the black and white points are taken.
+   Guard: `grep -q '52xd-background'`.
+
+   Design points worth not re-litigating:
+   - The background is **not** freed in `goodix52xd_reset_state()`, which runs
+     on every deactivate. fprintd deactivates between operations and a verify
+     is a single scan that starts with the finger already coming down, so a
+     verify would never see an idle frame of its own — and a template enrolled
+     with subtraction cannot match a verify captured without it. It is freed in
+     `dev_deinit()` (img_close) and `finalize()` only.
+   - Idle frames are folded in with a **per-pixel maximum**, not "last one
+     wins". `goodix52xd_frame_is_empty()` is a heuristic and a light touch can
+     slip past it; a finger only pulls readings down, so max ignores those. The
+     window restarts after each capture (`background_used`) so the estimate
+     follows sensor drift instead of latching.
+   - With no background yet, output is **byte-identical** to the stock
+     pipeline. `tests/` asserts this.
+
+4. **`patch_libfprint_52xd_bz3()`** → `drivers/goodixtls/goodix52xd.c`.
    The driver sets `bz3_threshold = 24` (libfprint's own default is 40) and
    unrelated fingers cleared it — a confirmed false-accept on real hardware.
    Raised to 40 so it fails closed. `GOODIX_BZ3_THRESHOLD=<n>` overrides.
    Guard: `grep -q 'bz3-threshold'` — note the PSK patch also writes the string
    `goodix-fp-setup` into this same file, so the guards must stay distinct.
 
-Patches 2 and 3 are tuned from **one** reader. Treat the values as
+Patches 2 and 4 are tuned from **one** reader. Treat the values as
 hardware-specific until someone else confirms them.
 
-### The false-accept problem (the important open issue)
+### The false-accept problem
 
 A finger that was never enrolled verifies successfully. The threshold was only
 half of it — the root cause is the image the driver produces:
@@ -84,7 +110,7 @@ half of it — the root cause is the image the driver produces:
 - `goodix52xd_image_from_frame()` takes **one** raw 64×80 frame,
   `squash_frame_linear()` stretches its own min/max to 0–255, and it is
   nearest-neighbour doubled to 128×160. That is the entire image pipeline.
-- No calibration/background frame is subtracted. The 52XD driver has no
+- No calibration/background frame was subtracted. The 52XD driver has no
   `empty_img` field at all, whereas `goodix511` has one, captures
   `GOODIX511_CAP_FRAMES 40` frames per scan, and runs
   `fpi_do_movement_estimation()` + `fpi_assemble_frames()` over them.
@@ -92,21 +118,60 @@ half of it — the root cause is the image the driver produces:
   dead code, no accumulation.
 - Consequence: NBIS extracts few minutiae (hence `No minutiae found` in the
   journal) and those it finds are partly the sensor's fixed pattern, which is
-  the same for every finger. So any two prints score alike.
+  the same for every finger. So any two prints score alike. Under `--sigfm` the
+  same cause shows up as enroll failing with `Not enough keypoints found`.
 
-Raising the threshold cannot manufacture ridge detail. The real fixes, roughly
-in order of effort: subtract a background frame (the last frame
-`goodix52xd_frame_is_empty()` accepted while waiting *is* a background frame,
-so this is tractable); pick the best of several frames after finger-down instead
-of the first non-empty one; or port SIGFM. None are done.
+**v1.2.0 subtracts a background frame** (`patch_libfprint_52xd_background()`).
+The driver already polls frames while waiting for a finger and discards the
+empty ones — those *are* calibration frames, so this costs no extra USB
+traffic and needs no SSM changes. Reference implementation is the org's
+`goodix5xx.c` (`linear_subtract_inplace`, called from `scan_on_read_img`
+after a dedicated `SCAN_STAGE_CALIBRATE`); ours differs in taking the frames
+opportunistically rather than adding a state.
+
+Signal is `background - frame` (a finger presses the reading down), written
+back inverted so `squash_frame_linear()` still yields dark ridges. Note the
+org's version has an unsigned wrap bug there — `max - ((max - src) - (max -
+by))` goes badly when `src > by`; ours clamps.
+
+**Unverified on hardware.** Still not done, in rough order of expected value:
+pick the best of several frames after finger-down instead of the first
+non-empty one (`self->frames` is already there for it, but it needs SSM work
+and the poll loop's behaviour with a finger down is unknown); prime a
+background during activation so the very first scan after `img_open` has one
+(today it falls back to the stock pipeline and logs `no Goodix 52xd background
+frame yet`); stitching.
+
+### Testing
+
+`tests/run-pipeline-test.sh` is the only automated check in the repo. It clones
+the pinned libfprint fork, sources `install.sh` with `main` neutered, runs
+`patch_libfprint_52xd_background()` against the tree, slices the patched
+pipeline back out of the driver, and compiles `tests/test_pipeline.c` over it —
+so it tests the shipped code, not a copy. Covers idempotency across
+`git checkout --force`, both env knobs, and the pipeline's numerics including
+the byte-identity property when no background is available.
+
+Runs on macOS (needs git, python3, a C compiler, glib-2.0). **Add to it rather
+than writing a throwaway harness** — the previous three (`scratchpad/check.sh`,
+`port.py`, `idem.sh`, all referenced below) were never committed and are gone.
 
 ## How debug.sh works
 
 Writes `/tmp/goodix-fp-debug.log` and echoes it between BEGIN/END markers so the user
 can paste one block. Sections: system, reader on the USB bus, installed state, the
-52XD PSK patch, OpenSSL, fprintd, read-only firmware probe, a libfprint enroll capture
-with `G_MESSAGES_DEBUG=all`, a goodix-fp-dump control test, and the installer log tail.
+52XD PSK patch, the 52XD image pipeline, the matcher in use, OpenSSL, fprintd,
+read-only firmware probe, a libfprint enroll capture with `G_MESSAGES_DEBUG=all`,
+frame statistics, a goodix-fp-dump control test, and the installer log tail.
 Flags: `-o/--out`, `-t/--timeout` (default 45), `--no-capture`, `--no-print`, `-h`, `-V`.
+
+Both capture modes set `GOODIX52XD_DUMP_DIR=/tmp/goodix-fp-frames`
+(`GOODIX_DEBUG_FRAME_DIR` overrides) and `GOODIX52XD_DUMP_RAW=1`, so the driver
+writes every frame it decoded as a 16-bit big-endian P5 PGM with maxval 4095.
+`summarise_frames()` puts min/max/mean/high-pixels and an idle-vs-FINGER verdict
+per frame into the report — **the frames themselves deliberately stay out of it**,
+because the report is meant to be pasted in public and they are fingerprint
+images. The report tells the user how to tar them up or delete them.
 
 `--match-test` (v1.1.0) measures whether the matcher separates fingers at all:
 enrol into a `mktemp -d`, then N verifies with the same finger and N with a
@@ -208,8 +273,74 @@ directions).
 (gudev/udev). What *is* checked: the patch applies clean to pristine 1.94.10 and
 the result passes `check.sh`; `sigfm.cpp` compiles clean against OpenCV 5.0 (its
 API use is stable 4.5→5.0); all 7 `sigfm_*` functions are declared, defined and
-`extern "C"`; the five install-time patches are idempotent. **The link step and
-runtime behaviour are still unverified.**
+`extern "C"`; the install-time patches are idempotent.
+
+**Hardware result (2026-08-15, user's 521d):** it builds, installs, and fprintd
+starts — but **enrolling fails**. No logs captured. Near-certain cause:
+`fp_image_extract_sigfm_info()` errors with `Not enough keypoints found: N of
+25`, because the pre-1.2.0 image is mostly fixed pattern and SIFT has nothing
+to key on. `fpi_image_device_minutiae_detected()` turns any non-cancel error
+into `FP_DEVICE_RETRY_GENERAL`, so `priv->enroll_stage` never advances and
+enroll spins until it gives up — it does not surface the real message.
+Retry `--sigfm` on top of v1.2.0's background subtraction before touching
+`GOODIX_SIGFM_MIN_KEYPOINTS`; lowering the gate past a genuinely featureless
+image just stores a print that matches anybody.
+
+The `< 25` gate is upstream's, not ours — `fp-image.c:319` on the org's `sigfm`
+branch has the same constant hardcoded. Our patch only made it a
+`-DSIGFM_MIN_KEYPOINTS` define.
+
+## Upstream ecosystem (from the Discord `#github` export, 2021-07 → 2026-08)
+
+The export is a GitHub webhook feed, not conversation: 1198 messages, 1194 of
+them bot notifications. Useful as a commit/PR/issue index. It is **not
+committed** — it was dropped into the working tree locally, and publishing a
+Discord export is the user's call, not ours. Everything load-bearing from it is
+summarised here.
+`goodix-fp-dump` and `libfprint` are still getting PRs in 2026, but a
+maintainer said in April 2026 that *"there isn't any work being done on this
+whole project at this moment ... the lead maintainer"* is absent, so PRs sit
+open.
+
+Facts worth carrying:
+
+- **Nobody upstream has a 52XD driver.** `goodix-fp-linux-dev/libfprint`
+  branches (`master`, `goodixtls`, `sigfm`, `buildpackage`, two wip sigfm
+  branches) carry `goodix511` and `goodix5xx` only. The 521d driver exists in
+  exactly two places: `djnz00/libfprint` (1.94.10, our default) and
+  `infinytum/libfprint@unstable` (1.94.1, our `--legacy-driver`).
+- **The whole ecosystem converged on the same two fixes we needed**: background
+  subtraction and SIGFM instead of NBIS. `goodix-fp-dump` PR #33 (2023),
+  libfprint PRs #34 (5e0a), #36 (5f10), #37 (511, 2026-06) — #37's root-cause
+  paragraph is our symptom verbatim: *"enrollment completes successfully but
+  `fprintd-verify` always returns `verify-no-match` ... NBIS performs poorly on
+  the sensor's low-resolution 80×64 images."*
+- **PR #34 is the closest analogue to the 521d.** 27c6:5e0a, firmware
+  `GFUSB_GM168SEC_APP_10034` — the *same* firmware family string as 521d — with
+  dual TLS-PSK and SIGFM. Its commit log walks the exact arc we are on:
+  `Debug minutiae: enrollment 3.1 avg minutiae, verify 0-1, score always 0/5` →
+  `SIGFM integrated, calibration disabled` → `WORKING: enrollment 20/20,
+  verify-match on first attempt!`. Worth reading before the next iteration.
+  Caveat: several of these 2026 PRs are self-described as vibe-coded, and #34
+  is unreviewable by its own maintainer's admission.
+- **PR #37 also carries two build fixes** we may want: `dependency('udev')` →
+  `dependency('libudev')` in `meson.build` (Debian pkg-config name), and making
+  `doctest` optional in `libfprint/sigfm/meson.build`. Our patch already drops
+  doctest and `tests.cpp` entirely, so only the udev one might matter.
+- **The AUR package gives Arch users nothing we do not build.**
+  `libfprint-goodix-521d` is `infinytum/libfprint@unstable` (1.94.1) built with
+  plain `arch-meson`, `conflicts=(libfprint)`, installed system-wide as a
+  replacement — i.e. exactly our `--legacy-driver`, minus every patch, and with
+  a *worse* scoping story than our fprintd-only `LD_LIBRARY_PATH` drop-in. It
+  is at pkgrel 9, last touched 2024-12-29, 2 votes. There is no newer or better
+  Goodix 521d package on the AUR. Nothing to port from it. (Its one real trick,
+  `-Wno-incompatible-pointer-types`, install.sh already applies.)
+- Recurring user-facing issues to recognise: `ValueError: Invalid OTP` on
+  `run_521d.py` (issues #16, #41, #44 — PR #68 claims `read_otp()` asks for 0
+  bytes and should ask for 0x40, but its own author then reported still
+  authenticating with other fingers); `ModuleNotFoundError` from running
+  `sudo python` outside the venv; `ConnectionRefusedError` from racing
+  `openssl s_server` startup.
 
 ## Conventions
 
@@ -235,23 +366,21 @@ runtime behaviour are still unverified.**
 
 ## Open items
 
-- **False accepts are unresolved.** See "The false-accept problem" above. The
-  threshold bump is a mitigation, not a fix. Waiting on `--match-test` numbers
-  from the user's reader to know whether the score distributions overlap.
-- **`--sigfm` is built but unverified on hardware.** See "The SIGFM port" below.
-- **SIGFM background** (`goodix-fp-linux-dev/sigfm`): a SIFT matcher
-  written specifically for 64×80 sensors. **Not usable today** — no published branch
-  combines `libfprint/sigfm/` with the goodixtls 52xd driver. The org's `sigfm`
-  branches carry only `goodixmoc`; its `goodixtls` branch carries only `goodix511`.
-  Repo last pushed 2022-11-13. A port means grafting `libfprint/sigfm/` into djnz00's
-  fork, adding `opencv4 >= 4.5.0` + `doctest` to meson *and* to install.sh's per-distro
-  dep lists, and forward-porting ~59 refs across `fpi-print.c` (21), `fp-image.c` (26),
-  `fp-print.c` (12) from 1.94.5 → 1.94.10. It also changes the stored print format
-  (SIFT descriptors vs NBIS minutiae), invalidating existing enrollments.
-  Gate on evidence: only worth it if `fprintd-verify` shows frequent false rejects.
-- **Three upstream bugs** in `djnz00/libfprint` worth reporting, none filed: the
-  missing 10019 PSK, the unreachable `5100` threshold, and the false accepts
-  (single-frame image + no background subtraction + `bz3_threshold = 24`, which
-  the 511 and 53xd drivers share).
-- install.sh v1.0.5 / debug.sh v1.1.0 have **not** been confirmed on hardware.
+- **Waiting on hardware results for v1.2.0.** Background subtraction is the
+  root-cause fix and is unverified. What to ask for, in order: `debug.sh
+  --match-test` (score separation) and the raw frames it now leaves in
+  `/tmp/goodix-fp-frames`. With real frames the pipeline can be tuned offline
+  against `tests/test_pipeline.c` instead of guessed at.
+- **Retry `--sigfm` on top of v1.2.0** before doing anything else to it. See
+  the hardware result under "The SIGFM port".
+- **Next driver improvements**, if v1.2.0 is not enough: best-of-N frames after
+  finger-down, and priming a background at activation. Both need SSM work; see
+  "The false-accept problem".
+- **Consider PR #34's 5e0a driver as a reference** — same GM168SEC firmware
+  family, same symptom, reportedly solved. See "Upstream ecosystem".
+- **Four upstream bugs** in `djnz00/libfprint` worth reporting, none filed: the
+  missing 10019 PSK, the unreachable `5100` threshold, no background
+  subtraction, and `bz3_threshold = 24` (the latter two shared with the 511 and
+  53xd drivers).
+- install.sh v1.2.0 / debug.sh v1.3.0 have **not** been confirmed on hardware.
   The finger-off fix in 1.0.4 was — scanning is fast now.

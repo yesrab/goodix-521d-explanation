@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 
 # ---------------------------------------------------------------------------
 # Paths — must match install.sh
@@ -43,6 +43,9 @@ readonly LDSOCONF="/etc/ld.so.conf.d/000-goodix-fp-setup.conf"
 readonly SETUP_LOG="/var/log/goodix-fp-setup.log"
 readonly BUILD_DIR="$SRC_DIR/libfprint/build-goodix"
 readonly FPDUMP_DIR="$SRC_DIR/goodix-fp-dump"
+# Where the driver is told to dump the frames it decodes. It refuses any
+# directory that is readable by group or other, so this gets chmod 700.
+readonly FRAME_DIR="${GOODIX_DEBUG_FRAME_DIR:-/tmp/goodix-fp-frames}"
 
 readonly GOODIX_VID="27c6"
 SYSFS_USB="${GOODIX_SYSFS_USB:-/sys/bus/usb/devices}"
@@ -330,6 +333,23 @@ collect_install_state() {
         rep "(no libfprint checkout at $drv)"
     fi
 
+    # Whatever the matcher is, it can only work with the image the driver hands
+    # it. The stock driver stretches one raw frame with the sensor's fixed
+    # pattern still in it, which is the root cause behind both "No minutiae
+    # found" and SIGFM's "Not enough keypoints found".
+    sec "52XD image pipeline"
+    if [[ -f "$drv" ]]; then
+        if grep -q '52xd-background' "$drv"; then
+            rep "BACKGROUND SUBTRACTION PRESENT — captures have the last idle frame"
+            rep "subtracted before the contrast stretch."
+            runsh "stretch clip" "grep -n 'GOODIX52XD_STRETCH_CLIP_PERMILLE ' '$drv'"
+        else
+            rep "BACKGROUND SUBTRACTION MISSING — the driver stretches a single raw"
+            rep "frame, so the image is mostly sensor pattern and every finger looks"
+            rep "alike to the matcher. Re-run install.sh 1.2.0 or newer."
+        fi
+    fi
+
     # Which matcher the built library actually uses. The scores further down mean
     # different things depending on the answer, so establish it up front.
     sec "Matcher in use"
@@ -416,6 +436,16 @@ capture_libfprint() {
     note "for ${CAPTURE_SECS}s. Watch for 'TLS server waiting to accept...' and"
     note "whether 'TLS server accept done' ever follows it."
 
+    # The driver will dump every frame it decodes if pointed at a private
+    # directory. Only the statistics go into the report — the frames themselves
+    # are fingerprint images and stay on disk for the user to send or delete.
+    rm -rf "$FRAME_DIR"
+    if mkdir -p "$FRAME_DIR"; then
+        chmod 700 "$FRAME_DIR"
+    else
+        warn "Could not create $FRAME_DIR; frames will not be dumped."
+    fi
+
     printf '\n'
     printf '  %sTouch the sensor now.%s Press and lift your finger repeatedly for the\n' "$C_BOLD" "$C_RESET"
     printf '  next %s seconds. Starting in 3...\n' "$CAPTURE_SECS"
@@ -423,7 +453,9 @@ capture_libfprint() {
 
     local rc=0
     printf '6\ny\n' | timeout -k 5 -s INT "${CAPTURE_SECS}s" \
-        env G_MESSAGES_DEBUG=all "$bin" >>"$REPORT" 2>&1 || rc=$?
+        env G_MESSAGES_DEBUG=all \
+            GOODIX52XD_DUMP_DIR="$FRAME_DIR" GOODIX52XD_DUMP_RAW=1 \
+            "$bin" >>"$REPORT" 2>&1 || rc=$?
     rep "[exit $rc]"
     if (( rc == 124 || rc == 130 )); then
         rep "[timed out after ${CAPTURE_SECS}s — it hung rather than failing]"
@@ -431,6 +463,56 @@ capture_libfprint() {
     else
         ok "Enroll test finished on its own (exit $rc)."
     fi
+
+    summarise_frames
+}
+
+# One line of statistics per dumped frame. This is what tells us whether the
+# driver ever saw an idle frame to calibrate against, and how much of the
+# range a finger actually moves — neither is visible in the journal.
+summarise_frames() {
+    sec "Frame statistics"
+
+    local n=0
+    if [[ -d "$FRAME_DIR" ]]; then
+        n=$(find "$FRAME_DIR" -name '*raw-frame.pgm' | wc -l | tr -d ' ')
+    fi
+    if [[ "$n" == "0" ]]; then
+        rep "(no frames dumped — either no scan completed, or this libfprint"
+        rep "predates the driver's GOODIX52XD_DUMP_DIR support)"
+        return 0
+    fi
+
+    runsh "per-frame stats" "python3 - '$FRAME_DIR' <<'PY'
+import glob, os, struct, sys
+
+paths = sorted(glob.glob(os.path.join(sys.argv[1], '*raw-frame.pgm')))
+print('%-14s %6s %6s %6s %8s  %s' % ('frame', 'min', 'max', 'mean', 'high', 'verdict'))
+for path in paths[:60]:
+    with open(path, 'rb') as handle:
+        blob = handle.read()
+    # P5\n<w> <h>\n4095\n then big-endian 16-bit samples.
+    head = blob.split(b'\n', 3)
+    w, h = (int(v) for v in head[1].split())
+    pix = struct.unpack('>%dH' % (w * h), head[3][:w * h * 2])
+    mean = sum(pix) // len(pix)
+    high = sum(1 for p in pix if p > 2800)
+    # The driver's own two rules for 'no finger on the sensor'.
+    empty = (1900 <= mean <= 2200 and high <= 16) or (mean >= 3600 and high >= 4500)
+    print('%-14s %6d %6d %6d %8d  %s' % (os.path.basename(path)[:14], min(pix),
+                                         max(pix), mean, high,
+                                         'idle' if empty else 'FINGER'))
+if len(paths) > 60:
+    print('... %d more' % (len(paths) - 60))
+PY"
+
+    rep ""
+    rep "$n raw frames are in $FRAME_DIR (fingerprint images — they are NOT in"
+    rep "this report). To share them for tuning:"
+    rep "    sudo tar czf ~/goodix-frames.tar.gz -C '$(dirname "$FRAME_DIR")' '$(basename "$FRAME_DIR")'"
+    rep "Otherwise delete them: sudo rm -rf '$FRAME_DIR'"
+    info "Raw frames saved to $FRAME_DIR ($n frames)."
+    return 0
 }
 
 # Independent implementation of the same handshake, as a control.
@@ -593,7 +675,9 @@ match_test_scan() {
     prompt_enter "$prompt" || return 1
     info "Scanning — follow the prompts the example prints (up to ${secs}s)."
     ( cd "$MATCH_WORK" && printf '%b' "$keys" \
-        | timeout -k 5 -s INT "${secs}s" env G_MESSAGES_DEBUG=all "$bin" ) \
+        | timeout -k 5 -s INT "${secs}s" \
+          env G_MESSAGES_DEBUG=all \
+              GOODIX52XD_DUMP_DIR="$FRAME_DIR" GOODIX52XD_DUMP_RAW=1 "$bin" ) \
         >"$out" 2>&1 || rc=$?
     printf '%s\n' "[exit $rc]" >>"$out"
     if (( rc == 124 || rc == 130 )); then
@@ -626,6 +710,16 @@ collect_match_test() {
     MATCH_WORK="$(mktemp -d /tmp/goodix-match-XXXXXX)" || return 0
     rep "scratch directory: $MATCH_WORK (deleted on exit)"
     rep "rounds per finger:  $MATCH_ROUNDS"
+
+    # Unlike the scratch directory, the frames outlive the run: a score that
+    # says "these images carry no ridge detail" is only actionable if the
+    # images themselves can be looked at afterwards.
+    rm -rf "$FRAME_DIR"
+    if mkdir -p "$FRAME_DIR"; then
+        chmod 700 "$FRAME_DIR"
+    else
+        warn "Could not create $FRAME_DIR; frames will not be dumped."
+    fi
 
     local log="$MATCH_WORK/round.log"
     local same=() other=() threshold=""
@@ -717,6 +811,7 @@ collect_match_test() {
         fi
     fi
 
+    summarise_frames
     return 0
 }
 

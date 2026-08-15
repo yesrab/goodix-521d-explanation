@@ -33,17 +33,20 @@ Run `... \| sudo bash -s -- --help` for the full list. The log is at `/var/log/g
 
 **Which libfprint does it build?** By default, [`djnz00/libfprint`](https://github.com/djnz00/libfprint) — libfprint 1.94.10, actively maintained, and it accepts the **stock** `GFUSB_GM168SEC_APP_10034` firmware as well as the downgraded `10019`. That means a 521d on stock firmware often needs no flashing at all. `--legacy-driver` switches to [`infinytum/libfprint`](https://github.com/infinytum/libfprint), which is what the AUR package `libfprint-goodix-521d` builds from — libfprint 1.94.1, last updated in 2021, and it only accepts `10019`.
 
-Two patches are applied to that fork before building:
+Four patches are applied to that fork before building:
 
 1. Its 52XD driver ships the TLS pre-shared key for `10034` but not for `10019`, so a reader on `10019` opens fine and then fails every enroll with `Goodix TLS PSK is not configured`. The `10019` key is 32 zero bytes — the value `goodix-fp-dump` writes to the sensor, and the one whose sha256 is the driver's own `goodix_52xd_pmk_hash_10019` — so the script puts it back.
 2. Its "sensor is empty again" test can never match on some 521d units, which makes the reader appear to hang for tens of seconds between enroll scans. The saturated-frame rule wants `high_pixels >= 5100` out of 64×80 pixels, but ~284 of them never cross the threshold, so it tops out at 4836. The script lowers that cut to where the hardware actually separates. `GOODIX_KEEP_STOCK_EMPTY_THRESHOLDS=1` builds the stock values instead.
-3. Its 52XD driver sets the match threshold to 24, well under libfprint's own default of 40, while handing the matcher a single 64×80 frame with no calibration frame subtracted and no frame stitching — so fingers that were never enrolled can clear it. The script raises it to 40. `GOODIX_BZ3_THRESHOLD=<n>` builds a different value. See the warning below.
+3. **Its captures have the sensor's own fixed pattern in them, and nothing removes it.** `goodix52xd_image_from_frame()` contrast-stretches a single raw frame; the idle sensor reads near saturation with a per-pixel offset that is several times larger than the ridge signal, so what reaches the matcher is mostly sensor and only slightly finger. The script subtracts an idle frame first. The driver already polls frames while waiting for a finger and throws the empty ones away — those *are* calibration frames, so this costs no extra traffic. `GOODIX_KEEP_STOCK_IMAGE_PIPELINE=1` builds the stock single-frame stretch instead.
+4. Its 52XD driver sets the match threshold to 24, well under libfprint's own default of 40, so fingers that were never enrolled could clear it. The script raises it to 40. `GOODIX_BZ3_THRESHOLD=<n>` builds a different value. See the warning below.
+
+Patch 3 is the same fix the rest of the ecosystem converged on independently: the sibling `goodix511` driver has always subtracted a calibration frame (`goodix5xx.c`, `linear_subtract_inplace`), `goodix-fp-dump` PR #33 added background subtraction because it was *"enough to make sigfm happy with 5395"*, and libfprint PR #37 added contrast normalisation to `goodix511` for the same reason.
 
 ### ⚠ This reader may accept the wrong finger
 
-On at least one 521d, an enrolled finger and a completely different one both verified successfully. The cause is in the driver, not in the threshold alone: `goodix52xd_image_from_frame()` contrast-stretches **one** raw 64×80 frame and doubles it to 128×160, with no calibration frame subtracted and no stitching. The sibling `goodix511` driver captures 40 frames and runs `fpi_assemble_frames()` over them; the 52XD driver does neither. NBIS therefore finds few real minutiae — you will see `Failed to detect minutiae: No minutiae found` in the fprintd journal — and what it does find comes partly from the sensor's fixed pattern, which is identical no matter whose finger is on it.
+On at least one 521d, an enrolled finger and a completely different one both verified successfully. The root cause was the image, not the threshold: with no calibration frame subtracted, NBIS finds few real minutiae — you will see `Failed to detect minutiae: No minutiae found` in the fprintd journal — and what it does find comes partly from the sensor's fixed pattern, which is identical no matter whose finger is on it.
 
-Raising the threshold makes the reader fail closed rather than fail open, but it does not create ridge detail that was never captured. **Test your own reader before trusting it with a login:**
+Patch 3 above addresses that directly, and patch 4 makes the reader fail closed rather than open in the meantime. **Neither has been confirmed on hardware yet, so test your own reader before trusting it with a login:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/debug.sh | sudo bash -s -- --match-test
@@ -52,6 +55,8 @@ curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main
 That enrolls a finger into a scratch directory, asks you to scan the same finger and then a different one, and prints the match score of every attempt alongside an ASCII rendering of each captured image. If a finger you never enrolled reaches the threshold, the report says so in as many words. Nothing is written to your account and the scratch directory is deleted on exit.
 
 If the two groups of scores overlap, no threshold setting can separate them and the reader is not usable for authentication as things stand.
+
+Both capture modes also leave the raw frames the driver decoded in `/tmp/goodix-fp-frames`, with per-frame statistics in the report. Those files are fingerprint images and are deliberately *not* included in the pasteable report — send them only if you mean to, and `sudo rm -rf /tmp/goodix-fp-frames` otherwise.
 
 ### `--sigfm`: the SIFT matcher
 
@@ -63,7 +68,8 @@ curl -fsSL https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main
 
 **This is experimental and you should read the whole of this section before using it.**
 
-- **No published branch shipped this.** SIGFM lives on `goodix-fp-linux-dev/libfprint@sigfm`, which is libfprint 1.94.5 and whose only Goodix driver is `goodixmoc` — no goodixtls, so no 521d. No driver on that branch selects SIGFM at all, so this code path had never been exercised before. `patches/sigfm-libfprint-1.94.10.patch` rebases it onto djnz00's 1.94.10 and wires the 52XD driver to it.
+- **No published branch shipped this for the 521d.** SIGFM lives on `goodix-fp-linux-dev/libfprint@sigfm`, which is libfprint 1.94.5 and whose only Goodix driver is `goodixmoc`; no branch there carries the 52XD driver at all. Open pull requests do combine SIGFM with `goodixtls` drivers ([#34](https://github.com/goodix-fp-linux-dev/libfprint/pull/34) for 5e0a, [#36](https://github.com/goodix-fp-linux-dev/libfprint/pull/36) for 5f10, [#37](https://github.com/goodix-fp-linux-dev/libfprint/pull/37) for 511), but none of them for 521d, and none are merged. `patches/sigfm-libfprint-1.94.10.patch` rebases SIGFM onto djnz00's 1.94.10 and wires the 52XD driver to it.
+- **Enrolling can fail outright with `Not enough keypoints found`.** SIFT needs detail to key on, and until patch 3 above there was none: the fixed pattern is the same in every frame, so it produces no distinguishing keypoints. If you hit this, the image is the problem — lowering `GOODIX_SIGFM_MIN_KEYPOINTS` past it just stores a print that will match anybody.
 - **Three defects in that branch's code are fixed in the patch**, all of which would bite immediately: serialising a print called `g_clear_object()` on a `GPtrArray`; every scan leaked its `SigfmImgInfo`; and verify could read an uninitialised match result. The patch also keeps `sigfm.hpp` out of the installed public headers, which upstream did not.
 - **Needs OpenCV ≥ 4.5** development files — specifically the `opencv4` pkg-config module; OpenCV 5 ships `opencv5` and will not be found. `--sigfm` adds the right package for your distro automatically.
 - **Existing enrollments stop working.** SIGFM stores SIFT descriptors where NBIS stored minutiae. Delete and re-enroll (`fprintd-delete $USER`, then `fprintd-enroll`). Going back to NBIS means re-enrolling again.

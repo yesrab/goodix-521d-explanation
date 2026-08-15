@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.2"
+readonly SCRIPT_VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1301,6 +1301,328 @@ PYEOF
     fi
 }
 
+# The root cause behind both failure modes we see on the 521d: the image the
+# driver hands the matcher is mostly sensor, not finger.
+#
+# goodix52xd_image_from_frame() contrast-stretches ONE raw 64x80 frame and
+# nearest-neighbour doubles it. The idle sensor reads near saturation (mean
+# ~3900 of 4095) and every pixel carries its own offset, so that fixed pattern
+# survives the stretch and is identical for every finger. NBIS then logs "No
+# minutiae found" and unrelated fingers score alike; SIGFM finds too few SIFT
+# keypoints and enrolling fails outright with "Not enough keypoints found".
+#
+# The sibling goodix511 driver has always subtracted a calibration frame
+# (goodix5xx.c, linear_subtract_inplace) and the same fix keeps turning up
+# elsewhere in the ecosystem: goodix-fp-dump PR #33 ("subtracts background from
+# raw image ... enough to make sigfm happy with 5395") and libfprint PR #37,
+# which added contrast normalisation to goodix511 for exactly this reason.
+#
+# Here it costs no extra USB traffic at all. The driver already polls frames
+# while waiting for a finger and throws away the ones it classifies as empty —
+# the last of those *is* a calibration frame, captured moments before the scan
+# rather than once per activation.
+#
+# Set GOODIX_KEEP_STOCK_IMAGE_PIPELINE=1 to build the driver's own single-frame
+# stretch instead. GOODIX_52XD_STRETCH_CLIP_PERMILLE tunes how much of the
+# histogram's tails are clipped when picking the black and white points; 0 is a
+# true min/max stretch, which lets one hot pixel own the whole output range.
+#
+# sync_repo() checks out --force, so this is re-applied on every run.
+patch_libfprint_52xd_background() {
+    local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
+    local clip="${GOODIX_52XD_STRETCH_CLIP_PERMILLE:-20}"
+
+    [[ -f "$file" ]] || return 0
+    if [[ -n "${GOODIX_KEEP_STOCK_IMAGE_PIPELINE:-}" ]]; then
+        info "Keeping the driver's own single-frame image pipeline."
+        warn "Without background subtraction the matcher cannot tell fingers apart."
+        return 0
+    fi
+    if [[ ! "$clip" =~ ^[0-9]+$ ]] || (( clip > 400 )); then
+        warn "GOODIX_52XD_STRETCH_CLIP_PERMILLE='$clip' is not a permille under 400; using 20."
+        clip=20
+    fi
+    # patch_libfprint_52xd_psk() writes "goodix-fp-setup" and
+    # patch_libfprint_52xd_bz3() writes "bz3-threshold" into this same file, so
+    # this guard has to be a string only this patch produces.
+    if grep -q '52xd-background' "$file"; then
+        dbg "goodix52xd.c already subtracts a background frame."
+        return 0
+    fi
+
+    if python3 - "$file" "$clip" <<'PYEOF'
+import sys
+
+path, clip = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    source = handle.read()
+
+edits = []
+
+# 1. Somewhere to keep the calibration frame between the poll and the capture.
+edits.append((
+    """  GSList* frames;
+  FpiSsm* scan_ssm;
+""",
+    """  GSList* frames;
+  /* 52xd-background: an idle frame, kept so the next capture can have the
+     sensor's fixed pattern subtracted out. See goodix52xd_note_idle_frame(). */
+  Goodix52xdPix* background;
+  gboolean background_used;
+  FpiSsm* scan_ssm;
+""",
+))
+
+# 2. The subtraction itself, in front of the stretch it feeds.
+edits.append((
+    """/**
+ * @brief Squashes the 12 bit pixels of a raw frame into the 4 bit pixels used
+""",
+    """/* 52xd-background: 12-bit sensor, so this is the saturation point. */
+#define GOODIX52XD_PIX_MAX 4095
+
+/* A min/max stretch lets a single hot pixel own the whole output range, so the
+   black and white points are taken this far into the histogram's tails
+   instead. 0 restores a true min/max stretch. Set at install time with
+   GOODIX_52XD_STRETCH_CLIP_PERMILLE. */
+#define GOODIX52XD_STRETCH_CLIP_PERMILLE %(clip)s
+
+/**
+ * @brief Folds an idle frame into the background estimate. Takes ownership.
+ *
+ * @details goodix52xd_frame_is_empty() is a heuristic, and a light touch can
+ * slip past it — that frame would otherwise become the background and get
+ * subtracted from the next real capture. A finger can only pull a reading
+ * down, though, so taking the per-pixel maximum across the idle frames of one
+ * scan cycle ignores any that were not really idle.
+ *
+ * The window restarts after every capture rather than accumulating forever,
+ * so the background follows the sensor's drift instead of latching onto the
+ * brightest reading it has ever seen.
+ */
+static void goodix52xd_note_idle_frame(FpiDeviceGoodixTls52XD* self,
+                                       Goodix52xdPix* frame)
+{
+    guint i;
+
+    if (!self->background || self->background_used) {
+        g_free(self->background);
+        self->background = frame;
+        self->background_used = FALSE;
+        return;
+    }
+
+    for (i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
+        if (frame[i] > self->background[i])
+            self->background[i] = frame[i];
+
+    g_free(frame);
+}
+
+/**
+ * @brief Cancels the sensor's fixed pattern out of a raw frame, in place.
+ *
+ * @details The idle sensor reads near saturation and each pixel carries its
+ * own offset. Stretching a single frame therefore yields an image whose
+ * structure is mostly sensor rather than ridges, which is why NBIS reports no
+ * minutiae and unrelated fingers match. goodix511 solves this with a
+ * calibration frame (goodix5xx.c, linear_subtract_inplace); the empty frames
+ * this driver already polls while waiting for a finger serve the same purpose.
+ *
+ * A finger presses the reading down, so the signal is background - frame. It
+ * is written back inverted so that squash_frame_linear() still produces
+ * libfprint's convention of dark ridges on a light background.
+ *
+ * @param frame the captured frame, rewritten in place
+ * @param background the last idle frame, or NULL if none has been seen yet
+ */
+static void goodix52xd_apply_background(Goodix52xdPix* frame,
+                                        const Goodix52xdPix* background)
+{
+    guint hist[GOODIX52XD_PIX_MAX + 1] = { 0 };
+    guint clip = (GOODIX52XD_FRAME_SIZE * GOODIX52XD_STRETCH_CLIP_PERMILLE)
+                 / 1000;
+    guint lo = 0, hi = GOODIX52XD_PIX_MAX;
+    guint seen, i;
+
+    if (!background) {
+        fp_dbg("no Goodix 52xd background frame yet; using the frame as captured");
+        return;
+    }
+
+    for (i = 0; i != GOODIX52XD_FRAME_SIZE; ++i) {
+        gint signal = (gint) background[i] - (gint) frame[i];
+
+        if (signal < 0)
+            signal = 0;
+        if (signal > GOODIX52XD_PIX_MAX)
+            signal = GOODIX52XD_PIX_MAX;
+
+        frame[i] = (Goodix52xdPix) signal;
+        hist[signal]++;
+    }
+
+    for (seen = 0, i = 0; i <= GOODIX52XD_PIX_MAX; ++i) {
+        seen += hist[i];
+        if (seen > clip) {
+            lo = i;
+            break;
+        }
+    }
+    for (seen = 0, i = GOODIX52XD_PIX_MAX + 1; i-- > 0;) {
+        seen += hist[i];
+        if (seen > clip) {
+            hi = i;
+            break;
+        }
+    }
+    /* Every pixel inside the clipped tails, i.e. a frame with no contrast. */
+    if (hi <= lo) {
+        lo = 0;
+        hi = GOODIX52XD_PIX_MAX;
+    }
+
+    fp_dbg("Goodix 52xd background subtracted; signal window %%u-%%u", lo, hi);
+
+    for (i = 0; i != GOODIX52XD_FRAME_SIZE; ++i) {
+        guint signal = frame[i];
+
+        if (signal < lo)
+            signal = lo;
+        if (signal > hi)
+            signal = hi;
+
+        frame[i] = (Goodix52xdPix) (GOODIX52XD_PIX_MAX - signal);
+    }
+}
+
+/**
+ * @brief Squashes the 12 bit pixels of a raw frame into the 4 bit pixels used
+""" % {"clip": clip},
+))
+
+# 3./4. Keep the empty frames instead of dropping them. g_steal_pointer leaves
+#       frame NULL, so the g_free that followed becomes a no-op.
+edits.append((
+    """        if (empty) {
+            g_free(frame);
+            g_slist_free_full(g_steal_pointer(&self->frames), g_free);
+            self->scan_frame_count = 0;
+            if (self->image_frame_count < GOODIX52XD_EMPTY_POLL_FRAMES) {
+""",
+    """        if (empty) {
+            /* 52xd-background: an idle frame is the calibration frame the next
+               capture needs, so keep it rather than throwing it away. */
+            goodix52xd_note_idle_frame(self, g_steal_pointer(&frame));
+            g_slist_free_full(g_steal_pointer(&self->frames), g_free);
+            self->scan_frame_count = 0;
+            if (self->image_frame_count < GOODIX52XD_EMPTY_POLL_FRAMES) {
+""",
+))
+
+edits.append((
+    """        g_free(frame);
+
+        if (empty) {
+            gboolean report_finger_off = self->finger_reported;
+""",
+    """        /* 52xd-background: the finger has just come off, so this frame is
+           idle too and is the freshest calibration frame available. */
+        if (empty)
+            goodix52xd_note_idle_frame(self, g_steal_pointer(&frame));
+        g_free(frame);
+
+        if (empty) {
+            gboolean report_finger_off = self->finger_reported;
+""",
+))
+
+# 5. The capture itself.
+edits.append((
+    """        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
+        self->finger_reported = TRUE;
+
+        img = goodix52xd_image_from_frame(frame);
+""",
+    """        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
+        self->finger_reported = TRUE;
+
+        goodix52xd_apply_background(frame, self->background);
+        self->background_used = TRUE;
+        img = goodix52xd_image_from_frame(frame);
+""",
+))
+
+# 6. Lifetime. Deliberately NOT freed in goodix52xd_reset_state(), which runs
+#    on every deactivate: fprintd deactivates the device between operations,
+#    and a verify is a single scan that begins with the finger already coming
+#    down, so it would never get to see an idle frame of its own. Enrolled
+#    templates and verify scans have to come out of the same pipeline or
+#    nothing matches. The pattern is a property of the silicon, and it is
+#    refreshed at every finger-off, so carrying it across an activation is
+#    safe. It only goes when the device is closed.
+edits.append((
+    """static void dev_deinit(FpImageDevice *img_dev) {
+  FpDevice *dev = FP_DEVICE(img_dev);
+  GError *error = NULL;
+
+  goodix52xd_cancel_scan(FPI_DEVICE_GOODIXTLS52XD(img_dev));
+  goodix52xd_reset_state(FPI_DEVICE_GOODIXTLS52XD(img_dev));
+""",
+    """static void dev_deinit(FpImageDevice *img_dev) {
+  FpDevice *dev = FP_DEVICE(img_dev);
+  FpiDeviceGoodixTls52XD *self = FPI_DEVICE_GOODIXTLS52XD(img_dev);
+  GError *error = NULL;
+
+  goodix52xd_cancel_scan(self);
+  goodix52xd_reset_state(self);
+  /* 52xd-background: kept across deactivations, dropped when we close. */
+  g_clear_pointer(&self->background, g_free);
+""",
+))
+
+edits.append((
+    """    goodix52xd_reset_state(self);
+    g_clear_pointer(&self->otp, g_free);
+""",
+    """    goodix52xd_reset_state(self);
+    g_clear_pointer(&self->background, g_free);
+    g_clear_pointer(&self->otp, g_free);
+""",
+))
+
+edits.append((
+    """    self->frames = NULL;
+    self->finger_reported = FALSE;
+""",
+    """    self->frames = NULL;
+    self->background = NULL;
+    self->background_used = FALSE;
+    self->finger_reported = FALSE;
+""",
+))
+
+for old, _ in edits:
+    if source.count(old) != 1:
+        sys.stderr.write("anchor not found exactly once:\n%s\n" % old)
+        sys.exit(1)
+
+for old, new in edits:
+    source = source.replace(old, new)
+
+with open(path, "w") as handle:
+    handle.write(source)
+PYEOF
+    then
+        ok "52XD captures now have the sensor's background frame subtracted."
+        (( clip != 20 )) && info "Stretch clip: $clip permille."
+    else
+        warn "Could not add background subtraction to goodix52xd.c — the driver has changed."
+        warn "The reader will still enrol, but the matcher may not tell fingers apart."
+    fi
+    return 0
+}
+
 # Grafts SIGFM onto the tree. The patch adds libfprint/sigfm/ and rebases the
 # core matcher hooks from goodix-fp-linux-dev/libfprint@sigfm (libfprint 1.94.5)
 # onto 1.94.10. sync_repo() checks out --force, so this reapplies every run.
@@ -1411,6 +1733,7 @@ build_libfprint() {
 
     patch_libfprint_52xd_psk "$src"
     patch_libfprint_52xd_finger_off "$src"
+    patch_libfprint_52xd_background "$src"
     patch_libfprint_52xd_bz3 "$src"
 
     local optfile="" candidate
