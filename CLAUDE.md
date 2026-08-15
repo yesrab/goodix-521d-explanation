@@ -403,15 +403,24 @@ perfectly ordinary 210 keypoints, and it beat every genuine attempt. The
 default is now 250 so it fails closed rather than open, and the installer says
 so out loud.
 
-That it was a *slipped* press is a lead rather than an excuse. A finger moving
-across the sensor smears ridges into long streaks, and long streaks generate a
-lot of collinear keypoint pairs — exactly what a matcher counting agreeing
-pair geometries rewards. The five clean, deliberate left-thumb presses topped
-out at 88; the one that slipped scored 838. Worth testing whether motion during
-a press is what produces the high impostor scores, and whether rejecting it
-fixes the overlap: the four frames of a press are already in hand, so the
-frame-to-frame difference is free to compute and a press that moves too much
-could be rejected outright rather than averaged into a smear.
+**The "it was a slipped press" lead was tested and does not hold.** The theory
+was that a finger sliding across the sensor smears ridges into streaks, streaks
+generate collinear keypoint pairs, and a matcher counting agreeing pair
+geometries rewards exactly that — so detecting motion within a press and
+rejecting it would remove the false accepts for free, since the frames are
+already accumulated. Six labelled presses of one finger (three deliberately
+still, three deliberately sliding) gave mean frame-to-frame differences of
+160/170/229 for the still ones and 45/68/116/56 for the sliding ones. Backwards,
+and the six attempts produced seven presses, so the labels do not even line up.
+Frame-to-frame difference does not measure what we wanted it to. Do not spend
+time here again without a better motion metric.
+
+**The deeper problem is that the score is not stable.** Across all genuine
+attempts it ranged from 0 to 7108 for the same finger against the same
+templates — four orders of magnitude. Two deliberately identical still presses
+scored 0 and 7108. A quantity that unstable cannot be thresholded no matter
+where the threshold goes, and that, rather than any particular bad press, is
+why this does not work yet.
 
 **Why it still fails, most likely:** `sigfm_match_score()` returns a raw count
 of agreeing keypoint-pair geometries. It is not normalised by how many
@@ -530,14 +539,8 @@ Ordered by what the hardware session showed actually matters.
   user, and the diagnosis is already written down under "Hardware session".
   The probe must compare the device's PSK hash against the driver's table, not
   just the firmware string, and flash when it does not match.
-- **Reject presses where the finger moved.** The single false accept that
-  defeats every threshold was a confirmed slipped press. The frames of a press
-  are already accumulated, so the mean absolute difference between consecutive
-  frames costs nothing; above some threshold the press is a smear and should be
-  reported as a retry rather than averaged. Needs a measurement of what a
-  still press versus a moving one actually looks like numerically — dump frames
-  with `GOODIX52XD_DUMP_DIR` while deliberately sliding a finger.
-- **Normalise the SIGFM score.** The other promising lead.
+- **Normalise the SIGFM score.** The main remaining lead, and the one that
+  addresses the instability directly.
   `sigfm_match_score()` counts agreeing keypoint-pair geometries without
   dividing by how many pairs were considered, so it rewards large match sets
   rather than similar ones. That is consistent with the one impostor that
