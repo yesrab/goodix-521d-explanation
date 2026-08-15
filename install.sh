@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -104,6 +104,11 @@ DRIVER_MODULE=""
 RUN_SCRIPT=""
 TARGET_FW=""
 EXTRA_FW=""
+# The PSK hash goodix52xd.c carries for EXTRA_FW. A reader whose hash differs
+# holds an OEM key nobody can recover, so it has to be flashed to TARGET_FW even
+# though its firmware string looks supported. Measured on a real 521d that
+# reported 4ad0df80...f012a86d and could not activate.
+EXTRA_FW_PMK_HASH=""
 LIBFPRINT_OK=0
 FPRINTD_MASKED=0
 TTY_FD_OPEN=0
@@ -458,12 +463,16 @@ python_ok_for_flashing() {
 
 device_table() {
     # Fills DRIVER_MODULE / RUN_SCRIPT / TARGET_FW / EXTRA_FW / LIBFPRINT_OK.
-    DRIVER_MODULE=""; RUN_SCRIPT=""; TARGET_FW=""; EXTRA_FW=""; LIBFPRINT_OK=0
+    DRIVER_MODULE=""; RUN_SCRIPT=""; TARGET_FW=""; EXTRA_FW=""; EXTRA_FW_PMK_HASH=""; LIBFPRINT_OK=0
     case "$1" in
         5110) DRIVER_MODULE="driver_51x0"; RUN_SCRIPT="run_5110.py"; TARGET_FW="GF_ST411SEC_APP_12117";    LIBFPRINT_OK=1 ;;
         5117) DRIVER_MODULE="driver_51x7"; RUN_SCRIPT="run_5117.py"; TARGET_FW="GF_ST411SEC_APP_12109" ;;
         521d) DRIVER_MODULE="driver_52xd"; RUN_SCRIPT="run_521d.py"; TARGET_FW="GFUSB_GM168SEC_APP_10019"; LIBFPRINT_OK=1
-              (( LEGACY_DRIVER )) || EXTRA_FW="GFUSB_GM168SEC_APP_10034" ;;
+              if (( ! LEGACY_DRIVER )); then
+                  EXTRA_FW="GFUSB_GM168SEC_APP_10034"
+                  # goodix_52xd_pmk_hash_10034 in goodix52xd.h.
+                  EXTRA_FW_PMK_HASH="8b20e9bf659c6e34e27881612010b1b467c378f3e13334c57fb63fae960e7c89"
+              fi ;;
         532d) DRIVER_MODULE="driver_53xd"; RUN_SCRIPT="run_532d.py"; TARGET_FW="GF5298_GM168SEC_APP_13016" ;;
         538d) DRIVER_MODULE="driver_53xd"; RUN_SCRIPT="run_538d.py"; TARGET_FW="GF5298_GM168SEC_APP_13016"; LIBFPRINT_OK=1 ;;
         5503) DRIVER_MODULE="driver_5503"; RUN_SCRIPT="run_5503.py"; TARGET_FW="GF3208_RTSEC_APP_10062" ;;
@@ -721,8 +730,24 @@ def release(device):
         pass
 
 
+def read_pmk_hash(device):
+    """The sha256 the sensor holds for its PSK, as hex, or None.
+
+    goodix52xd.c compares this against a table before it will even start the
+    TLS handshake, so a firmware string alone does not tell us the reader is
+    usable: units ship with OEM keys whose hash is in nobody's table.
+    """
+    try:
+        ok, _flags, data = device.preset_psk_read(0xbb020001, 0, 0)
+    except Exception:
+        return None
+    if not ok or not data:
+        return None
+    return bytes(data).hex()
+
+
 def probe(driver, product):
-    """Return (firmware, psk_valid). Either may be None if unreadable."""
+    """Return (firmware, psk_valid, pmk_hash). Any may be None if unreadable."""
     device = None
     try:
         device = driver.init_device(product)
@@ -731,7 +756,7 @@ def probe(driver, product):
             psk = driver.check_psk(device)
         except Exception:
             psk = None
-        return firmware, psk
+        return firmware, psk, read_pmk_hash(device)
     finally:
         if device is not None:
             release(device)
@@ -742,6 +767,8 @@ def main():
     parser.add_argument("--module", required=True, help="e.g. driver_52xd")
     parser.add_argument("--product", required=True, help="e.g. 0x521d")
     parser.add_argument("--extra-ok", default="", help="comma separated extra acceptable firmware strings")
+    parser.add_argument("--extra-ok-pmk-hash", default="",
+                        help="comma separated PSK hashes libfprint carries for --extra-ok firmwares")
     parser.add_argument("--source-dir", required=True, help="the goodix-fp-dump checkout")
     parser.add_argument("--probe-only", action="store_true",
                         help="report the firmware and exit; never opens the device twice")
@@ -775,18 +802,32 @@ def main():
         acceptable += [f for f in args.extra_ok.split(",") if f]
 
         try:
-            firmware, psk = probe(driver, product)
+            firmware, psk, pmk_hash = probe(driver, product)
         except Exception as error:
             print("GFP_PROBE_ERROR=%s" % error)
             return EXIT_PROBE_FAILED
 
         print("GFP_FIRMWARE=%s" % firmware)
         print("GFP_PSK_VALID=%s" % psk)
+        print("GFP_PMK_HASH=%s" % pmk_hash)
 
         target = getattr(driver, TARGET_ATTR, "")
-        # The target firmware still needs the driver PSK written, otherwise
-        # upstream's own loop would erase and re-flash it anyway.
-        if (firmware in acceptable) and (firmware != target or psk is not False):
+        usable = (firmware in acceptable) and (firmware != target or psk is not False)
+
+        # Keeping a non-target firmware is only safe if libfprint holds the key
+        # for it. Ours does for exactly one hash; anything else is an OEM key we
+        # cannot recover, and activation would fail with "Unsupported device PSK
+        # hash". Flashing to the target replaces it with one we do have.
+        if usable and firmware != target and args.extra_ok_pmk_hash:
+            wanted = [h for h in args.extra_ok_pmk_hash.lower().split(",") if h]
+            if (pmk_hash or "").lower() not in wanted:
+                print("GFP_STATUS=EXTRA_FW_UNKNOWN_PMK")
+                print("GFP: firmware %s is supported but its PSK hash %s is not "
+                      "one libfprint carries; flashing %s instead."
+                      % (firmware, pmk_hash, target))
+                return EXIT_NEEDS_FLASH
+
+        if usable:
             print("GFP_STATUS=ALREADY_SUPPORTED")
             return EXIT_OK
 
@@ -991,7 +1032,8 @@ probe_firmware() {
     # Prints the driver's report; returns 0 = supported, 10 = flash needed, other = error.
     "$VENV_DIR/bin/python" "$BIN_DIR/gfp_flash.py" \
         --source-dir "$SRC_DIR/goodix-fp-dump" \
-        --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" --probe-only
+        --module "$DRIVER_MODULE" --product "0x$DEV_PID" --extra-ok "$EXTRA_FW" \
+        --extra-ok-pmk-hash "$EXTRA_FW_PMK_HASH" --probe-only
 }
 
 usb_reset() {
@@ -1246,8 +1288,13 @@ patch_libfprint_52xd_bz3() {
     # agreeing keypoint-pair geometries rather than bozorth3 points — a totally
     # different scale, so it gets its own knob.
     if (( SIGFM )); then
+        # 40 is the bozorth3 default and means nothing on SIGFM's scale, where
+        # the score counts agreeing keypoint-pair geometries. Measured on a real
+        # 521d over 18 attempts: genuine 37-607, impostor 0-838. The
+        # distributions overlap, so no value is safe; this one fails closed
+        # rather than open. See "Hardware session" in CLAUDE.md.
         envname="GOODIX_SIGFM_THRESHOLD"
-        want="${GOODIX_SIGFM_THRESHOLD:-${GOODIX_BZ3_THRESHOLD:-40}}"
+        want="${GOODIX_SIGFM_THRESHOLD:-${GOODIX_BZ3_THRESHOLD:-250}}"
     else
         want="${GOODIX_BZ3_THRESHOLD:-40}"
     fi
@@ -1287,8 +1334,10 @@ PYEOF
     then
         if (( SIGFM )); then
             ok "Set the 52XD SIGFM score threshold to $want."
-            warn "That number is a guess until you measure it: run debug.sh --match-test"
-            warn "and set $envname to sit in the gap between your two score groups."
+            warn "On the one 521d this was measured on, genuine scores ran 37-607 and"
+            warn "an unenrolled finger reached 838. Those overlap: no threshold"
+            warn "separates them, and this one only fails closed. Measure your own with"
+            warn "debug.sh --match-test, and do not use this reader for login."
         else
             ok "Raised the 52XD match threshold to $want (driver ships 24)."
             if (( want < 40 )); then
@@ -1331,6 +1380,7 @@ PYEOF
 patch_libfprint_52xd_background() {
     local file="$1/libfprint/drivers/goodixtls/goodix52xd.c"
     local clip="${GOODIX_52XD_STRETCH_CLIP_PERMILLE:-20}"
+    local capture="${GOODIX_52XD_CAPTURE_FRAMES:-4}"
 
     [[ -f "$file" ]] || return 0
     if [[ -n "${GOODIX_KEEP_STOCK_IMAGE_PIPELINE:-}" ]]; then
@@ -1342,6 +1392,13 @@ patch_libfprint_52xd_background() {
         warn "GOODIX_52XD_STRETCH_CLIP_PERMILLE='$clip' is not a permille under 400; using 20."
         clip=20
     fi
+    # A press only lasts so long; asking for more frames than it yields just
+    # means the capture ends on the finger coming off, which is handled, but
+    # anything large would sit there polling for no gain.
+    if [[ ! "$capture" =~ ^[0-9]+$ ]] || (( capture < 1 || capture > 16 )); then
+        warn "GOODIX_52XD_CAPTURE_FRAMES='$capture' is not between 1 and 16; using 4."
+        capture=4
+    fi
     # patch_libfprint_52xd_psk() writes "goodix-fp-setup" and
     # patch_libfprint_52xd_bz3() writes "bz3-threshold" into this same file, so
     # this guard has to be a string only this patch produces.
@@ -1350,10 +1407,10 @@ patch_libfprint_52xd_background() {
         return 0
     fi
 
-    if python3 - "$file" "$clip" <<'PYEOF'
+    if python3 - "$file" "$clip" "$capture" <<'PYEOF'
 import sys
 
-path, clip = sys.argv[1], sys.argv[2]
+path, clip, capture = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path) as handle:
     source = handle.read()
 
@@ -1369,6 +1426,9 @@ edits.append((
      sensor's fixed pattern subtracted out. See goodix52xd_note_idle_frame(). */
   Goodix52xdPix* background;
   gboolean background_used;
+  /* 52xd-multiframe: running total of the frames of the press in progress. */
+  guint32* capture_sum;
+  guint capture_frames;
   FpiSsm* scan_ssm;
 """,
 ))
@@ -1399,6 +1459,72 @@ edits.append((
  * (crop_frame in goodix511.c); extending the interior outwards costs nothing
  * and keeps the image dimensions the driver advertises.
  */
+/* 52xd-multiframe: how many frames of one press to average. One frame of this
+   sensor carries very little reproducible ridge detail -- matching a capture
+   against itself agrees on 190-340 SIFT keypoints, but two presses of the same
+   finger agree on 0-26, which is noise. Averaging the frames of a press roughly
+   doubles that agreement and removes the outright zeroes. Presses observed on
+   real hardware ran 3-7 frames, so this has to stay comfortably inside that;
+   a press that ends early emits whatever it managed to collect.
+   Set at install time with GOODIX_52XD_CAPTURE_FRAMES. */
+#define GOODIX52XD_CAPTURE_FRAMES %(capture)s
+
+/**
+ * @brief Adds a frame to the press being captured. Takes ownership.
+ */
+static void goodix52xd_accumulate_frame(FpiDeviceGoodixTls52XD* self,
+                                        Goodix52xdPix* frame)
+{
+    guint i;
+
+    if (!self->capture_sum) {
+        self->capture_sum = g_new0(guint32, GOODIX52XD_FRAME_SIZE);
+        self->capture_frames = 0;
+    }
+
+    for (i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
+        self->capture_sum[i] += frame[i];
+
+    self->capture_frames++;
+    g_free(frame);
+}
+
+/**
+ * @brief Averages the press and resets the accumulator.
+ *
+ * @details Averaging the raw frames is equivalent to averaging their
+ * background-subtracted signals -- the background is common to all of them --
+ * so the rest of the pipeline is unchanged, and clamping once at the end
+ * rather than per frame throws away less.
+ *
+ * @return the mean frame, caller frees, or NULL if nothing was captured
+ */
+static Goodix52xdPix* goodix52xd_take_mean_frame(FpiDeviceGoodixTls52XD* self)
+{
+    Goodix52xdPix* mean;
+    guint i;
+
+    if (!self->capture_sum || self->capture_frames == 0)
+        return NULL;
+
+    mean = g_malloc(GOODIX52XD_FRAME_SIZE * sizeof(Goodix52xdPix));
+    for (i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
+        mean[i] = (Goodix52xdPix) (self->capture_sum[i] / self->capture_frames);
+
+    fp_dbg("Goodix 52xd averaged %%u frames for this press", self->capture_frames);
+
+    g_clear_pointer(&self->capture_sum, g_free);
+    self->capture_frames = 0;
+
+    return mean;
+}
+
+static void goodix52xd_drop_capture(FpiDeviceGoodixTls52XD* self)
+{
+    g_clear_pointer(&self->capture_sum, g_free);
+    self->capture_frames = 0;
+}
+
 static void goodix52xd_repair_border(Goodix52xdPix* frame)
 {
     guint x, y;
@@ -1531,25 +1657,94 @@ static void goodix52xd_apply_background(Goodix52xdPix* frame,
 
 /**
  * @brief Squashes the 12 bit pixels of a raw frame into the 4 bit pixels used
-""" % {"clip": clip},
+""" % {"clip": clip, "capture": capture},
 ))
 
-# 3./4. Keep the empty frames instead of dropping them. g_steal_pointer leaves
-#       frame NULL, so the g_free that followed becomes a no-op.
+# 3./4. Keep the empty frames instead of dropping them, and hoist the emptiness
+#       test out of the "waiting for a finger" branch: with multi-frame capture
+#       every frame has to be tested, because an empty one now means the finger
+#       came off and the press is over. g_steal_pointer leaves frame NULL, so a
+#       following g_free is a no-op.
 edits.append((
-    """        if (empty) {
+    """    if (!self->finger_reported) {
+        Goodix52xdFrameStats stats = { 0 };
+        gboolean empty = goodix52xd_frame_is_empty(frame, &stats);
+
+        fp_dbg("awaiting-finger frame stats nonzero=%u min=%u max=%u mean=%u high=%u empty=%d",
+               stats.nonzero, stats.min, stats.max, stats.mean,
+               stats.high_pixels, empty);
+
+        if (empty) {
             g_free(frame);
             g_slist_free_full(g_steal_pointer(&self->frames), g_free);
             self->scan_frame_count = 0;
             if (self->image_frame_count < GOODIX52XD_EMPTY_POLL_FRAMES) {
+                fp_dbg("empty Goodix 52xd frame while awaiting finger; continuing image poll burst");
+                goodix52xd_continue_image_poll(dev, ssm);
+                return;
+            }
+
+            self->image_frame_count = 0;
+            fp_dbg("empty Goodix 52xd poll burst while awaiting finger; continuing wait");
+            fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_DOWN);
+            return;
+        }
+    }
 """,
-    """        if (empty) {
-            /* 52xd-background: an idle frame is the calibration frame the next
-               capture needs, so keep it rather than throwing it away. */
-            goodix52xd_note_idle_frame(self, g_steal_pointer(&frame));
-            g_slist_free_full(g_steal_pointer(&self->frames), g_free);
-            self->scan_frame_count = 0;
-            if (self->image_frame_count < GOODIX52XD_EMPTY_POLL_FRAMES) {
+    """    Goodix52xdFrameStats capture_stats = { 0 };
+    gboolean capture_frame_empty = goodix52xd_frame_is_empty(frame, &capture_stats);
+
+    fp_dbg("%s frame stats nonzero=%u min=%u max=%u mean=%u high=%u empty=%d",
+           self->finger_reported ? "capturing" : "awaiting-finger",
+           capture_stats.nonzero, capture_stats.min, capture_stats.max,
+           capture_stats.mean, capture_stats.high_pixels, capture_frame_empty);
+
+    if (capture_frame_empty && !self->finger_reported) {
+        /* 52xd-background: an idle frame is the calibration frame the next
+           capture needs, so keep it rather than throwing it away. */
+        goodix52xd_note_idle_frame(self, g_steal_pointer(&frame));
+        g_slist_free_full(g_steal_pointer(&self->frames), g_free);
+        self->scan_frame_count = 0;
+        if (self->image_frame_count < GOODIX52XD_EMPTY_POLL_FRAMES) {
+            fp_dbg("empty Goodix 52xd frame while awaiting finger; continuing image poll burst");
+            goodix52xd_continue_image_poll(dev, ssm);
+            return;
+        }
+
+        self->image_frame_count = 0;
+        fp_dbg("empty Goodix 52xd poll burst while awaiting finger; continuing wait");
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_DOWN);
+        return;
+    }
+""",
+))
+
+# A press interrupted by an error must not bleed into the next one.
+edits.append((
+    """    g_slist_free_full(g_steal_pointer(&dev->frames), g_free);
+    dev->scan_frame_count = 0;
+    dev->image_frame_count = 0;
+    dev->finger_reported = FALSE;
+""",
+    """    g_slist_free_full(g_steal_pointer(&dev->frames), g_free);
+    goodix52xd_drop_capture(dev);
+    dev->scan_frame_count = 0;
+    dev->image_frame_count = 0;
+    dev->finger_reported = FALSE;
+""",
+))
+
+edits.append((
+    """    g_slist_free_full(g_steal_pointer(&dev->frames), g_free);
+    dev->scan_frame_count = 0;
+    dev->image_frame_count = 0;
+    dev->waiting_finger_off = TRUE;
+""",
+    """    g_slist_free_full(g_steal_pointer(&dev->frames), g_free);
+    goodix52xd_drop_capture(dev);
+    dev->scan_frame_count = 0;
+    dev->image_frame_count = 0;
+    dev->waiting_finger_off = TRUE;
 """,
 ))
 
@@ -1570,20 +1765,86 @@ edits.append((
 """,
 ))
 
-# 5. The capture itself.
+# 5. The capture. The driver used the first frame with a finger on it and threw
+#    the rest of the press away; now the press is averaged. The old
+#    "unexpected extra image" failure is gone because extra images are the
+#    point.
 edits.append((
-    """        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
+    """    if (!self->finger_reported) {
+        FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+        FpImage* img;
+
+        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
         self->finger_reported = TRUE;
 
         img = goodix52xd_image_from_frame(frame);
+        goodix52xd_debug_dump_image(img);
+
+        g_free(frame);
+        self->scan_frame_count = 0;
+        self->image_frame_count = 0;
+
+        fpi_ssm_next_state(ssm);
+
+        fpi_image_device_image_captured(img_dev, img);
+        return;
+    }
+
+    g_free(frame);
+    self->scan_frame_count = 0;
+    self->image_frame_count = 0;
+    fpi_ssm_mark_failed(
+        ssm,
+        g_error_new(G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Unexpected extra Goodix 52xd image after finger report"));
 """,
-    """        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
+    """    if (!self->finger_reported) {
+        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
         self->finger_reported = TRUE;
+    }
 
-        goodix52xd_repair_border(frame);
-        goodix52xd_apply_background(frame, self->background);
+    /* 52xd-multiframe: keep reading while the finger is down. An empty frame
+       here means it came off early, which simply ends the press. */
+    if (!capture_frame_empty) {
+        goodix52xd_accumulate_frame(self, g_steal_pointer(&frame));
+
+        if (self->capture_frames < GOODIX52XD_CAPTURE_FRAMES) {
+            fp_dbg("Goodix 52xd collected %u of %u frames for this press",
+                   self->capture_frames, (guint) GOODIX52XD_CAPTURE_FRAMES);
+            goodix52xd_continue_image_poll(dev, ssm);
+            return;
+        }
+    }
+
+    g_free(frame);
+    self->scan_frame_count = 0;
+    self->image_frame_count = 0;
+
+    {
+        FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+        Goodix52xdPix* mean = goodix52xd_take_mean_frame(self);
+        FpImage* img;
+
+        if (!mean) {
+            fpi_ssm_mark_failed(
+                ssm,
+                g_error_new(G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "No Goodix 52xd frames captured for this press"));
+            return;
+        }
+
+        goodix52xd_repair_border(mean);
+        goodix52xd_apply_background(mean, self->background);
         self->background_used = TRUE;
-        img = goodix52xd_image_from_frame(frame);
+        img = goodix52xd_image_from_frame(mean);
+        goodix52xd_debug_dump_image(img);
+        g_free(mean);
+
+        fpi_ssm_next_state(ssm);
+
+        fpi_image_device_image_captured(img_dev, img);
+        return;
+    }
 """,
 ))
 
@@ -1632,6 +1893,8 @@ edits.append((
     """    self->frames = NULL;
     self->background = NULL;
     self->background_used = FALSE;
+    self->capture_sum = NULL;
+    self->capture_frames = 0;
     self->finger_reported = FALSE;
 """,
 ))
@@ -1648,7 +1911,7 @@ with open(path, "w") as handle:
     handle.write(source)
 PYEOF
     then
-        ok "52XD captures now have the sensor's background frame subtracted."
+        ok "52XD captures average $capture frames and subtract the background."
         (( clip != 20 )) && info "Stretch clip: $clip permille."
     else
         warn "Could not add background subtraction to goodix52xd.c — the driver has changed."
@@ -1986,7 +2249,13 @@ EOF
 
     # Keep a copy of ourselves so the helper (and --uninstall) keep working.
     if [[ -n "${SELF_PATH:-}" && -f "$SELF_PATH" ]]; then
-        install -m 0755 "$SELF_PATH" "$STATE_DIR/install.sh"
+        # goodix-fp-fix execs this very path, so a re-run from there would ask
+        # install(1) to copy the file onto itself, which is an error.
+        if [[ "$SELF_PATH" -ef "$STATE_DIR/install.sh" ]]; then
+            chmod 0755 "$STATE_DIR/install.sh"
+        else
+            install -m 0755 "$SELF_PATH" "$STATE_DIR/install.sh"
+        fi
     else
         # We were piped in from curl and have no file on disk; fetch a copy.
         if have curl && curl -fsSL "${GOODIX_SELF_URL:-https://raw.githubusercontent.com/yesrab/goodix-521d-explanation/main/install.sh}" \

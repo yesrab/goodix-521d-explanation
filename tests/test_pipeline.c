@@ -18,6 +18,8 @@ typedef struct
 {
   Goodix52xdPix *background;
   gboolean       background_used;
+  guint32       *capture_sum;
+  guint          capture_frames;
 } FpiDeviceGoodixTls52XD;
 
 #include "pipeline.inc"
@@ -315,6 +317,57 @@ int main (void)
 
     g_clear_pointer (&dev.background, g_free);
     check ("background clears", dev.background == NULL);
+  }
+
+  /* 8. Multi-frame capture: one frame of this sensor is mostly noise, so the
+        press is averaged. The mean must be the actual arithmetic mean, the
+        accumulator must reset between presses, and an empty press must be
+        reported rather than silently producing an image. */
+  {
+    FpiDeviceGoodixTls52XD dev = { NULL, FALSE, NULL, 0 };
+    Goodix52xdPix *mean;
+
+    check ("an empty press yields no frame", goodix52xd_take_mean_frame (&dev) == NULL);
+
+    for (int n = 0; n != 4; ++n)
+      {
+        Goodix52xdPix *f = g_malloc (sizeof bg);
+        for (int i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
+          f[i] = (Goodix52xdPix) (1000 + n * 100);   /* mean is 1150 */
+        goodix52xd_accumulate_frame (&dev, f);
+      }
+    check ("the press counts its frames", dev.capture_frames == 4);
+
+    mean = goodix52xd_take_mean_frame (&dev);
+    check ("the mean is the arithmetic mean", mean && mean[0] == 1150 &&
+           mean[GOODIX52XD_FRAME_SIZE - 1] == 1150);
+    check ("taking the mean resets the accumulator",
+           dev.capture_sum == NULL && dev.capture_frames == 0);
+    g_free (mean);
+
+    /* Averaging really is averaging the signal: with a common background,
+       mean(bg - f_i) == bg - mean(f_i), which is why the rest of the pipeline
+       did not have to change. */
+    {
+      Goodix52xdPix a[4] = { 1000, 1200, 1400, 1600 };
+      guint32 sum = 0;
+      for (int i = 0; i != 4; ++i)
+        sum += (guint32) (3000 - a[i]);
+      check ("mean of the signals equals the signal of the mean",
+             sum / 4 == (guint32) (3000 - (1000 + 1200 + 1400 + 1600) / 4));
+    }
+
+    /* A press abandoned half way must not bleed into the next one. */
+    {
+      Goodix52xdPix *f = g_malloc (sizeof bg);
+      memset (f, 0, sizeof bg);
+      goodix52xd_accumulate_frame (&dev, f);
+      goodix52xd_drop_capture (&dev);
+      check ("dropping a partial press clears it",
+             dev.capture_sum == NULL && dev.capture_frames == 0);
+      check ("and the next press starts empty",
+             goodix52xd_take_mean_frame (&dev) == NULL);
+    }
   }
 
   printf ("\n%s (%d failure%s)\n", failures ? "FAILED" : "all checks passed",

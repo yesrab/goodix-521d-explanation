@@ -5,7 +5,7 @@ The repo is two shell scripts plus the original manual guide.
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | The deliverable. One-shot automated installer, currently **v1.3.0**. |
+| `install.sh` | The deliverable. One-shot automated installer, currently **v1.4.0**. |
 | `debug.sh` | One-shot diagnostic collector, currently **v1.3.0**. Read-only. |
 | `readme.md` | User-facing docs: automated path first, original manual guide below. |
 | `patches/` | `sigfm-libfprint-1.94.10.patch`, applied only by `--sigfm`. |
@@ -371,14 +371,46 @@ destriping (per-column and per-row mean removal) and then local contrast
 normalisation raised keypoints 193 → 280 → 335 and left cross-press agreement
 at 0–15 pairs. More keypoints, none of them reproducible.
 
-**Multi-frame averaging is the one thing that measurably helped.** Presses in
-the capture ran 3–7 frames; the driver uses only the first. Averaging a
-press's frames, or picking its highest-contact frame, took cross-press pairs
-from 1–26 (with many exact zeros) to 5–30 (no zeros), and scores from 0–600 to
-15–13800. Roughly double the agreement, and the zeros disappear. That is the
-next thing to implement — see "Open items". It is still nowhere near the
-~4M self-match, and **no different-finger measurement was taken under SIGFM**,
-so separation remains unproven.
+**Multi-frame averaging helped, and is implemented in v1.4.0.** Presses run
+3–7 frames and the driver used only the first; it now averages
+`GOODIX52XD_CAPTURE_FRAMES` (default 4) of them. Offline this took cross-press
+keypoint agreement from 1–26 pairs (with many exact zeros) to 5–30 (no zeros).
+On hardware it is the difference between SIGFM **never** matching and SIGFM
+matching: before averaging every genuine verify scored 0 against every stored
+template; after it, genuine verifies score in the hundreds.
+
+**And then the measurement that settles it.** 18 attempts on the real reader,
+SIGFM with background subtraction, border repair and 4-frame averaging:
+
+| | scores |
+| --- | --- |
+| genuine (right index, enrolled) | 37, 87, 108, 154, 220, 302, 330, 513, 521, 607 |
+| impostor (left thumb / other) | 0, 0, 0, 0, 10, 88, 175, 838 |
+
+They overlap, and not narrowly:
+
+| threshold | false reject | false accept |
+| --- | --- | --- |
+| 40 (the shipped default) | 10% | **38%** |
+| 200 | 40% | **12%** |
+| 600 | 90% | **12%** |
+| 900 | 100% | 0% |
+
+There is no usable threshold. The one impostor at 838 came from a press with a
+perfectly ordinary 210 keypoints, so it is not a quality artifact; it beat
+every genuine attempt. (Its provenance is the one soft spot in the data — it
+was an unspecified "different finger", while the five clean left-thumb presses
+maxed out at 88. Excluding it, 250 would give 50% false reject and 0% false
+accept, which is still not good.) The default is now 250 so it fails closed
+rather than open, and the installer says so out loud.
+
+**Why it still fails, most likely:** `sigfm_match_score()` returns a raw count
+of agreeing keypoint-pair geometries. It is not normalised by how many
+keypoints or matches went in, so it scales with the size of the match set
+rather than with similarity — which is exactly the property that lets an
+unrelated pair with many keypoints outscore a genuine pair with few. Dividing
+by the number of candidate pairs (a *fraction* consistent, not a count) is the
+obvious next experiment and can be tried offline against stored frames.
 
 **Do not tell anyone this reader is safe for login.** NBIS demonstrably
 false-accepts on this unit; SIGFM has not been shown to separate fingers at
@@ -489,15 +521,13 @@ Ordered by what the hardware session showed actually matters.
   user, and the diagnosis is already written down under "Hardware session".
   The probe must compare the device's PSK hash against the driver's table, not
   just the firmware string, and flash when it does not match.
-- **Implement multi-frame capture in goodix52xd.** The only change measured to
-  improve press-to-press reproducibility (roughly 2x the agreeing keypoints,
-  and no more exact zeros). Presses already deliver 3-7 frames and the driver
-  throws all but the first away; `self->frames` exists for it. Average them, or
-  take the highest-contact one. Needs SSM work in `scan_on_read_img` and the
-  poll loop, which is why it is not done yet.
-- **Then measure a different finger under SIGFM.** Never done. Without it there
-  is no separation number and no basis for a threshold. `debug.sh --match-test`
-  does exactly this if run locally on the machine.
+- **Normalise the SIGFM score.** The most promising open lead.
+  `sigfm_match_score()` counts agreeing keypoint-pair geometries without
+  dividing by how many pairs were considered, so it rewards large match sets
+  rather than similar ones. That is consistent with the one impostor that
+  outscored every genuine attempt. Returning a fraction instead of a count can
+  be tested entirely offline against dumped frames with the harness described
+  under "Working on the hardware".
 - **The saturated background is the deeper problem.** Calibrating against a
   railed reference cannot remove a gain artifact. Worth investigating whether
   the MCU config / OTP DAC values can bias the idle level into the linear
