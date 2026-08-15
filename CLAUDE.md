@@ -396,13 +396,22 @@ They overlap, and not narrowly:
 | 600 | 90% | **12%** |
 | 900 | 100% | 0% |
 
-There is no usable threshold. The one impostor at 838 came from a press with a
-perfectly ordinary 210 keypoints, so it is not a quality artifact; it beat
-every genuine attempt. (Its provenance is the one soft spot in the data — it
-was an unspecified "different finger", while the five clean left-thumb presses
-maxed out at 88. Excluding it, 250 would give 50% false reject and 0% false
-accept, which is still not good.) The default is now 250 so it fails closed
-rather than open, and the installer says so out loud.
+There is no usable threshold. The impostor at 838 was **confirmed by the
+operator as a right ring/middle finger that slipped during the press** — a
+different finger, not a mis-press of the enrolled one, so it counts. It had a
+perfectly ordinary 210 keypoints, and it beat every genuine attempt. The
+default is now 250 so it fails closed rather than open, and the installer says
+so out loud.
+
+That it was a *slipped* press is a lead rather than an excuse. A finger moving
+across the sensor smears ridges into long streaks, and long streaks generate a
+lot of collinear keypoint pairs — exactly what a matcher counting agreeing
+pair geometries rewards. The five clean, deliberate left-thumb presses topped
+out at 88; the one that slipped scored 838. Worth testing whether motion during
+a press is what produces the high impostor scores, and whether rejecting it
+fixes the overlap: the four frames of a press are already in hand, so the
+frame-to-frame difference is free to compute and a press that moves too much
+could be rejected outright rather than averaged into a smear.
 
 **Why it still fails, most likely:** `sigfm_match_score()` returns a raw count
 of agreeing keypoint-pair geometries. It is not normalised by how many
@@ -521,7 +530,14 @@ Ordered by what the hardware session showed actually matters.
   user, and the diagnosis is already written down under "Hardware session".
   The probe must compare the device's PSK hash against the driver's table, not
   just the firmware string, and flash when it does not match.
-- **Normalise the SIGFM score.** The most promising open lead.
+- **Reject presses where the finger moved.** The single false accept that
+  defeats every threshold was a confirmed slipped press. The frames of a press
+  are already accumulated, so the mean absolute difference between consecutive
+  frames costs nothing; above some threshold the press is a smear and should be
+  reported as a retry rather than averaged. Needs a measurement of what a
+  still press versus a moving one actually looks like numerically — dump frames
+  with `GOODIX52XD_DUMP_DIR` while deliberately sliding a finger.
+- **Normalise the SIGFM score.** The other promising lead.
   `sigfm_match_score()` counts agreeing keypoint-pair geometries without
   dividing by how many pairs were considered, so it rewards large match sets
   rather than similar ones. That is consistent with the one impostor that
