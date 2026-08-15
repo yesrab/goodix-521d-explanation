@@ -5,7 +5,7 @@ The repo is two shell scripts plus the original manual guide.
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | The deliverable. One-shot automated installer, currently **v1.2.0**. |
+| `install.sh` | The deliverable. One-shot automated installer, currently **v1.3.0**. |
 | `debug.sh` | One-shot diagnostic collector, currently **v1.3.0**. Read-only. |
 | `readme.md` | User-facing docs: automated path first, original manual guide below. |
 | `patches/` | `sigfm-libfprint-1.94.10.patch`, applied only by `--sigfm`. |
@@ -290,6 +290,122 @@ The `< 25` gate is upstream's, not ours — `fp-image.c:319` on the org's `sigfm
 branch has the same constant hardcoded. Our patch only made it a
 `-DSIGFM_MIN_KEYPOINTS` define.
 
+## Hardware session, 2026-08-15 (Mint 22.3 live, real 27c6:521d over SSH)
+
+First time any of this ran on the device. Everything below is measured, not
+inferred. Frames and prints are gone (live boot), the findings are not.
+
+**The reader was not usable at all at first, for a reason nothing predicted.**
+Activation died at `Unsupported device PSK hash`. The unit was on stock
+`GFUSB_GM168SEC_APP_10034` whose PSK hash is
+`4ad0df80af65fe22b1491b7cd726dab503162626b21fa35a33bc5835f012a86d` — neither
+sha256(32 zero bytes) (the 10019 value) nor djnz00's embedded 10034 hash
+(`8b20e9bf…`). It is an OEM key, and a hash is one-way. `goodix-fp-fix
+--force-flash` to 10019 fixed it (`Valid PSK: True`).
+
+**install.sh bug this exposed, still unfixed:** `device_table()`'s `EXTRA_FW`
+accepts 10034 on the firmware *string* alone. The driver additionally requires
+the PSK hash to match, so the installer happily skips the flash and leaves a
+reader that cannot activate. The probe must compare the PSK hash too, and
+`--force-flash` should not be needed for this. Second, smaller bug: running
+`install.sh` from `$STATE_DIR` makes the self-copy step do
+`install foo foo` → `are the same file` → exit 1 after the work is done.
+
+**Measured, NBIS with background subtraction (v1.2.0):** enrol 5/5, verify
+`verify-match` **score 74/40**. No `No minutiae found` anywhere — the
+subtraction did what it was meant to. But an unrelated finger scored **91**,
+*higher* than the enrolled one. Threshold tuning cannot fix that ordering.
+
+**Four more defects in the SIGFM port, all found on hardware, all now fixed**
+(numbering continues from the four in "The SIGFM port"):
+5. `fp_image_extract_sigfm_info()` set no GTask source tag, so the shared
+   callback ran `fp_image_detect_minutiae_finish()`, whose
+   `g_return_val_if_fail` on the tag returns FALSE **without setting `error`** —
+   and the caller then reads `error->message`. **SIGSEGV on the first scan.**
+   Fixed with a tagged task, a matching `fp_image_extract_sigfm_info_finish()`,
+   and a NULL-error guard at the call site.
+6. `fpi_print_add_from_image()` put the *image's* `sigfm_info` into
+   `print->prints` without transferring ownership. That array frees elements
+   with `sigfm_free_info` and so does `fp_image_finalize` (defect 2's leak fix),
+   so **double free** — `SIGSEGV in free()` under `fp_print_finalize`, visible
+   in `coredumpctl`. Fixed with `fp_image_steal_sigfm_info()`.
+7. `fp-image-device.c` hardcoded `fpi_print_set_type (enroll_print,
+   FPI_PRINT_NBIS)`. Every SIGFM stage then failed
+   `fpi_print_add_print`'s `add->type == print->type` assertion, and enrolment
+   stored a **52-byte print with an empty payload**; verify answered
+   `Cannot call sigfm match with non-sigfm print data, type was 2`. Now follows
+   `priv->algorithm`. A correct SIGFM enrolment stores ~440 KB.
+8. (not a defect, a symptom) SIGFM's `< 25` keypoint gate is upstream's own
+   (`fp-image.c` on the org's `sigfm` branch), not ours. Pre-v1.2.0 images gave
+   ~fewer than that, which is why `--sigfm` could not enrol at all. With
+   background subtraction it is 180–220, and with border repair 280–340.
+
+**Where it actually stands: the captures are not reproducible press to press.**
+This is the finding that matters, and it is measured, not guessed. Scoring the
+driver's own assembled images against each other with `sigfm_match_score`:
+
+| | self-match | different press, same finger |
+| --- | --- | --- |
+| ratio-test keypoint pairs | 190–340 | **0–26 of ~200** |
+| score | 2.4M–5.3M | 0–2000, frequently exactly 0 |
+
+Serialization is not the culprit — a round trip through
+`sigfm_serialize_binary`/`deserialize_binary` preserves all 468 keypoints and
+reproduces the score exactly. The images themselves do not repeat.
+
+**Why, in the sensor's own numbers:**
+- The idle frame is **saturated**: 279 of 279 idle frames had mean 3852–3904
+  with 4836/5120 pixels over 2800, i.e. railed near the 12-bit ceiling. A
+  clipped background carries no per-pixel gain information, so subtracting it
+  removes an offset and little else. Finger frames run 1388–3680, in the
+  linear range. Calibrating against a saturated reference is the core
+  limitation of the current approach.
+- Odd/even column split is **-3.9 counts on an idle frame** but **-142 on a
+  finger frame** — the readout artifact scales with signal, so it is a gain
+  effect that additive subtraction cannot touch.
+- There is a 1-pixel dead border (cols 0/63, rows 0/79, ~600 against a ~4000
+  interior). v1.3.0's `goodix52xd_repair_border()` handles this one.
+
+**Post-processing does not rescue it.** Replaying real frames through
+destriping (per-column and per-row mean removal) and then local contrast
+normalisation raised keypoints 193 → 280 → 335 and left cross-press agreement
+at 0–15 pairs. More keypoints, none of them reproducible.
+
+**Multi-frame averaging is the one thing that measurably helped.** Presses in
+the capture ran 3–7 frames; the driver uses only the first. Averaging a
+press's frames, or picking its highest-contact frame, took cross-press pairs
+from 1–26 (with many exact zeros) to 5–30 (no zeros), and scores from 0–600 to
+15–13800. Roughly double the agreement, and the zeros disappear. That is the
+next thing to implement — see "Open items". It is still nowhere near the
+~4M self-match, and **no different-finger measurement was taken under SIGFM**,
+so separation remains unproven.
+
+**Do not tell anyone this reader is safe for login.** NBIS demonstrably
+false-accepts on this unit; SIGFM has not been shown to separate fingers at
+all.
+
+### Working on the hardware
+
+Mint live at `mint@192.168.1.218` (password `mint99`, sudo passwordless).
+Live boot: everything under `/opt` and `/tmp` is RAM and vanishes on reboot,
+including the firmware-independent state — but the **firmware flash persists**,
+so a reflashed reader stays reflashed.
+
+- fprintd has `PrivateTmp=yes`, so `GOODIX52XD_DUMP_DIR=/tmp/...` lands in
+  `/tmp/systemd-private-*-fprintd.service-*/tmp/...`, and **restarting fprintd
+  gets a new private tmp and drops the old frames**. Copy them out first.
+- fprintd needs an active local seat; over SSH polkit denies everything. A rule
+  in `/etc/polkit-1/rules.d/` returning `polkit.Result.YES` for
+  `net.reactivated.fprint.*` is enough for testing. Remove it afterwards.
+- Prints live in `/var/lib/fprint/<user>/<driver>/<dev>/<finger>`, **not** under
+  `~/.local/share`. Clearing the wrong one wastes an enrolment cycle.
+- `pkill -f fprintd-enroll` over SSH matches the ssh command line itself and
+  kills the session. Use `pkill -x`.
+- The examples (`build-goodix/examples/{enroll,verify}`) exit during deactivate
+  without saving a print. Drive fprintd instead; it stores properly.
+- `coredumpctl debug --debugger-arguments="-batch -ex bt"` gets a backtrace and
+  is far faster than reasoning about which pointer died.
+
 ## Upstream ecosystem (from the Discord `#github` export, 2021-07 → 2026-08)
 
 The export is a GitHub webhook feed, not conversation: 1198 messages, 1194 of
@@ -366,21 +482,33 @@ Facts worth carrying:
 
 ## Open items
 
-- **Waiting on hardware results for v1.2.0.** Background subtraction is the
-  root-cause fix and is unverified. What to ask for, in order: `debug.sh
-  --match-test` (score separation) and the raw frames it now leaves in
-  `/tmp/goodix-fp-frames`. With real frames the pipeline can be tuned offline
-  against `tests/test_pipeline.c` instead of guessed at.
-- **Retry `--sigfm` on top of v1.2.0** before doing anything else to it. See
-  the hardware result under "The SIGFM port".
-- **Next driver improvements**, if v1.2.0 is not enough: best-of-N frames after
-  finger-down, and priming a background at activation. Both need SSM work; see
-  "The false-accept problem".
-- **Consider PR #34's 5e0a driver as a reference** — same GM168SEC firmware
-  family, same symptom, reportedly solved. See "Upstream ecosystem".
+Ordered by what the hardware session showed actually matters.
+
+- **Fix the `EXTRA_FW` PSK check in install.sh.** Highest priority: it is the
+  difference between "reader works" and "reader cannot activate", it bit a real
+  user, and the diagnosis is already written down under "Hardware session".
+  The probe must compare the device's PSK hash against the driver's table, not
+  just the firmware string, and flash when it does not match.
+- **Implement multi-frame capture in goodix52xd.** The only change measured to
+  improve press-to-press reproducibility (roughly 2x the agreeing keypoints,
+  and no more exact zeros). Presses already deliver 3-7 frames and the driver
+  throws all but the first away; `self->frames` exists for it. Average them, or
+  take the highest-contact one. Needs SSM work in `scan_on_read_img` and the
+  poll loop, which is why it is not done yet.
+- **Then measure a different finger under SIGFM.** Never done. Without it there
+  is no separation number and no basis for a threshold. `debug.sh --match-test`
+  does exactly this if run locally on the machine.
+- **The saturated background is the deeper problem.** Calibrating against a
+  railed reference cannot remove a gain artifact. Worth investigating whether
+  the MCU config / OTP DAC values can bias the idle level into the linear
+  range, which is presumably what the Windows driver does. This is real
+  reverse-engineering, not a patch.
+- **Fix the `install foo foo` exit 1** when install.sh runs from `$STATE_DIR`.
+  Cosmetic, but it makes a successful run look like a failure.
 - **Four upstream bugs** in `djnz00/libfprint` worth reporting, none filed: the
   missing 10019 PSK, the unreachable `5100` threshold, no background
   subtraction, and `bz3_threshold = 24` (the latter two shared with the 511 and
-  53xd drivers).
-- install.sh v1.2.0 / debug.sh v1.3.0 have **not** been confirmed on hardware.
-  The finger-off fix in 1.0.4 was — scanning is fast now.
+  53xd drivers). Plus the four SIGFM-port defects against
+  `goodix-fp-linux-dev/libfprint@sigfm`, three of which are crashes.
+- install.sh v1.3.0 is confirmed to **build, install and enrol** on hardware.
+  It is **not** confirmed to match safely, and on the evidence it does not.

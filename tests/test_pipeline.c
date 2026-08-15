@@ -47,6 +47,21 @@ static void stock_squash (const Goodix52xdPix *frame, guint8 *squashed)
 
 static int failures;
 
+/* note_idle_frame repairs the dead border on the way in, so comparisons
+   against a synthetic frame have to ignore that one-pixel ring. */
+static int
+interior_matches (const Goodix52xdPix *a, const Goodix52xdPix *b, int bias)
+{
+  for (int y = 1; y != GOODIX52XD_HEIGHT - 1; ++y)
+    for (int x = 1; x != GOODIX52XD_WIDTH - 1; ++x)
+      {
+        int i = x + y * GOODIX52XD_WIDTH;
+        if ((int) a[i] != (int) b[i] + bias)
+          return 0;
+      }
+  return 1;
+}
+
 static void check (const char *what, int ok)
 {
   printf ("%-58s %s\n", what, ok ? "PASS" : "FAIL");
@@ -89,7 +104,7 @@ int main (void)
   add_finger (frame, bg, 0);
   memcpy (keep, frame, sizeof frame);
 
-  /* 1. No background yet: the patch must be a no-op, byte for byte. */
+  /* 1. No background yet: the subtraction must be a no-op, byte for byte. */
   goodix52xd_apply_background (frame, NULL);
   check ("no background leaves the frame untouched",
          memcmp (frame, keep, sizeof frame) == 0);
@@ -97,6 +112,41 @@ int main (void)
   stock_squash (keep, stock);
   check ("no background gives byte-identical output to the stock pipeline",
          memcmp (patched, stock, sizeof patched) == 0);
+
+  /* 1b. The dead border is the one thing that changes unconditionally: on a
+         real 521d columns 0/63 and rows 0/79 are guard pixels reading ~600
+         against a ~4000 interior, and they are identical in every capture. */
+  {
+    static Goodix52xdPix bordered[GOODIX52XD_FRAME_SIZE];
+    int leaked = 0;
+
+    memcpy (bordered, keep, sizeof bordered);
+    for (int x = 0; x != GOODIX52XD_WIDTH; ++x)
+      {
+        bordered[x] = 600;
+        bordered[x + (GOODIX52XD_HEIGHT - 1) * GOODIX52XD_WIDTH] = 600;
+      }
+    for (int y = 0; y != GOODIX52XD_HEIGHT; ++y)
+      {
+        bordered[y * GOODIX52XD_WIDTH] = 600;
+        bordered[y * GOODIX52XD_WIDTH + GOODIX52XD_WIDTH - 1] = 600;
+      }
+    goodix52xd_repair_border (bordered);
+    for (int i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
+      if (bordered[i] == 600 && keep[i] != 600)
+        leaked++;
+    check ("the dead border is replaced by live neighbours", leaked == 0);
+
+    /* And it must not disturb anything else. */
+    {
+      int inner_changed = 0;
+      for (int y = 1; y != GOODIX52XD_HEIGHT - 1; ++y)
+        for (int x = 1; x != GOODIX52XD_WIDTH - 1; ++x)
+          if (bordered[x + y * GOODIX52XD_WIDTH] != keep[x + y * GOODIX52XD_WIDTH])
+            inner_changed++;
+      check ("border repair leaves the interior untouched", inner_changed == 0);
+    }
+  }
 
   /* 2. With a background, ridges must come out darker than valleys. */
   memcpy (frame, keep, sizeof frame);
@@ -244,19 +294,14 @@ int main (void)
       b[i] = bg[i] - 90;
     goodix52xd_note_idle_frame (&dev, b);
     check ("a frame with a finger still on it cannot lower the background",
-           memcmp (dev.background, bg, sizeof bg) == 0);
+           interior_matches (dev.background, bg, 0));
 
     /* A genuinely brighter idle frame does raise it. */
     for (int i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
       c[i] = bg[i] + 30;
     goodix52xd_note_idle_frame (&dev, c);
-    {
-      int raised = 1;
-      for (int i = 0; i != GOODIX52XD_FRAME_SIZE; ++i)
-        if (dev.background[i] != (Goodix52xdPix) (bg[i] + 30))
-          raised = 0;
-      check ("a brighter idle frame raises the background", raised);
-    }
+    check ("a brighter idle frame raises the background",
+           interior_matches (dev.background, bg, 30));
 
     /* After a capture the window restarts, so drift is tracked rather than
        latched: a dimmer idle frame now replaces outright. */

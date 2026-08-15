@@ -11,10 +11,29 @@ index b075634..a9a9342 100644
  
  
 diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
-index 519ad75..b860f43 100644
+index 519ad75..cf48a7d 100644
 --- a/libfprint/fp-image-device.c
 +++ b/libfprint/fp-image-device.c
-@@ -198,6 +198,13 @@ fp_image_device_constructed (GObject *obj)
+@@ -124,10 +124,16 @@ fp_image_device_start_capture_action (FpDevice *device)
+     {
+       FpPrint *enroll_print = NULL;
+ 
++      /* The print accumulating the enroll stages has to be the same type as
++         the per-stage prints fpi_image_device_minutiae_detected() produces,
++         which follow the driver's algorithm. Hardcoding NBIS here made
++         fpi_print_add_print() reject every SIGFM stage on its
++         'add->type == print->type' check, and enrolment then stored an empty
++         print that no verify could ever match. */
+       fpi_device_get_enroll_data (device, &enroll_print);
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (print_type != (FpiPrintType) priv->algorithm)
++        fpi_print_set_type (enroll_print, priv->algorithm);
+     }
+ 
+   priv->enroll_stage = 0;
+@@ -198,6 +204,13 @@ fp_image_device_constructed (GObject *obj)
    if (cls->bz3_threshold > 0)
      priv->bz3_threshold = cls->bz3_threshold;
  
@@ -29,7 +48,7 @@ index 519ad75..b860f43 100644
  }
  
 diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
-index f9c60b3..cc52f3f 100644
+index f9c60b3..e3fee8c 100644
 --- a/libfprint/fp-image.c
 +++ b/libfprint/fp-image.c
 @@ -64,6 +64,7 @@ fp_image_finalize (GObject *object)
@@ -134,7 +153,7 @@ index f9c60b3..cc52f3f 100644
  static void
  fp_image_detect_minutiae_free (DetectMinutiaeNbisData *data)
  {
-@@ -448,6 +536,51 @@ fp_image_get_minutiae (FpImage *self)
+@@ -448,6 +536,95 @@ fp_image_get_minutiae (FpImage *self)
    return self->minutiae;
  }
  
@@ -155,6 +174,22 @@ index f9c60b3..cc52f3f 100644
 +}
 +
 +/**
++ * fp_image_steal_sigfm_info:
++ * @self: A #FpImage
++ *
++ * Hands the extracted keypoints and descriptors over to the caller, which
++ * becomes responsible for freeing them with sigfm_free_info(). The image
++ * keeps no reference, so its finalizer will not free them a second time.
++ *
++ * Returns: (transfer full) (nullable): the image's #SigfmImgInfo
++ */
++SigfmImgInfo *
++fp_image_steal_sigfm_info (FpImage * self)
++{
++  return g_steal_pointer (&self->sigfm_info);
++}
++
++/**
 + * fp_image_extract_sigfm_info:
 + * @self: A #FpImage
 + * @cancellable: a #GCancellable, or %NULL
@@ -171,6 +206,7 @@ index f9c60b3..cc52f3f 100644
 +  ExtractSigfmData * data = g_new0 (ExtractSigfmData, 1);
 +
 +  task = g_task_new (self, cancellable, fp_image_sigfm_extract_cb, user_data);
++  g_task_set_source_tag (task, fp_image_extract_sigfm_info);
 +
 +  data->image = g_malloc (self->width * self->height);
 +  memcpy (data->image, self->data, self->width * self->height);
@@ -181,6 +217,33 @@ index f9c60b3..cc52f3f 100644
 +  g_task_set_task_data (task, data,
 +                        (GDestroyNotify) fp_image_sigfm_extract_free);
 +  g_task_run_in_thread (task, fp_image_sigfm_extract_thread_func);
++}
++
++/**
++ * fp_image_extract_sigfm_info_finish:
++ * @self: A #FpImage
++ * @result: A #GAsyncResult
++ * @error: Return location for errors, or %NULL to ignore
++ *
++ * Finish SIGFM keypoint extraction. This is the SIGFM counterpart of
++ * fp_image_detect_minutiae_finish(); the two are not interchangeable, because
++ * each checks that the result carries its own source tag.
++ *
++ * Returns: %TRUE on success
++ */
++gboolean
++fp_image_extract_sigfm_info_finish (FpImage      *self,
++                                    GAsyncResult *result,
++                                    GError      **error)
++{
++  g_return_val_if_fail (FP_IS_IMAGE (self), FALSE);
++  g_return_val_if_fail (g_task_is_valid (result, self), FALSE);
++  g_return_val_if_fail (g_task_get_source_tag (G_TASK (result)) ==
++                        fp_image_extract_sigfm_info, FALSE);
++
++  /* Unlike the NBIS path this never sets detection_in_progress, so there is
++     nothing to clear here. */
++  return g_task_propagate_boolean (G_TASK (result), error);
 +}
 +
  /**
@@ -273,7 +336,7 @@ index 84e51e4..70c0908 100644
      {
        g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
 diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
-index 5f9f65d..d53a2e1 100644
+index 5f9f65d..ce48942 100644
 --- a/libfprint/fpi-image-device.c
 +++ b/libfprint/fpi-image-device.c
 @@ -17,10 +17,12 @@
@@ -289,7 +352,34 @@ index 5f9f65d..d53a2e1 100644
  #include "fp-image-device.h"
  
  /**
-@@ -284,7 +286,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -250,13 +252,25 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+   FpDevice *device = FP_DEVICE (self);
+   FpImageDevicePrivate *priv;
+   FpiDeviceAction action;
++  gboolean finished;
+ 
+   /* Note: We rely on the device to not disappear during an operation. */
+   priv = fp_image_device_get_instance_private (FP_IMAGE_DEVICE (device));
+   priv->minutiae_scan_active = FALSE;
+ 
+-  if (!fp_image_detect_minutiae_finish (image, res, &error))
++  if (priv->algorithm == FPI_PRINT_SIGFM)
++    finished = fp_image_extract_sigfm_info_finish (image, res, &error);
++  else
++    finished = fp_image_detect_minutiae_finish (image, res, &error);
++
++  if (!finished)
+     {
++      /* A finisher can refuse the result without reporting why, and the
++         handling below reads error->message. */
++      if (!error)
++        error = g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                             "Image processing did not report a result");
++
+       /* Cancel operation . */
+       if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+         {
+@@ -284,7 +298,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
    if (!error)
      {
        print = fp_print_new (device);
@@ -298,7 +388,7 @@ index 5f9f65d..d53a2e1 100644
        if (!fpi_print_add_from_image (print, image, &error))
          {
            g_clear_object (&print);
-@@ -331,13 +333,22 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -331,13 +345,22 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
    else if (action == FPI_DEVICE_ACTION_VERIFY)
      {
        FpPrint *template;
@@ -324,7 +414,7 @@ index 5f9f65d..d53a2e1 100644
  
        if (!error || error->domain == FP_DEVICE_RETRY)
          fpi_device_verify_report (device, result, g_steal_pointer (&print), g_steal_pointer (&error));
-@@ -355,7 +366,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -355,7 +378,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
          {
            FpPrint *template = g_ptr_array_index (templates, i);
  
@@ -341,7 +431,7 @@ index 5f9f65d..d53a2e1 100644
              {
                result = template;
                break;
-@@ -508,12 +527,20 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+@@ -508,12 +539,20 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
  
    priv->minutiae_scan_active = TRUE;
  
@@ -426,7 +516,7 @@ index 71472db..2cb615a 100644
  
  void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
 diff --git a/libfprint/fpi-image.h b/libfprint/fpi-image.h
-index 0c703fb..412f2d6 100644
+index 0c703fb..050b417 100644
 --- a/libfprint/fpi-image.h
 +++ b/libfprint/fpi-image.h
 @@ -21,6 +21,7 @@
@@ -437,7 +527,7 @@ index 0c703fb..412f2d6 100644
  
  /**
   * FpiImageFlags:
-@@ -68,10 +69,21 @@ struct _FpImage
+@@ -68,10 +69,27 @@ struct _FpImage
    guint8    *binarized;
  
    GPtrArray *minutiae;
@@ -456,11 +546,17 @@ index 0c703fb..412f2d6 100644
 +
 +SigfmImgInfo *fp_image_get_sigfm_info (FpImage *self);
 +
++SigfmImgInfo *fp_image_steal_sigfm_info (FpImage *self);
++
++gboolean fp_image_extract_sigfm_info_finish (FpImage       *self,
++                                             GAsyncResult  *result,
++                                             GError       **error);
++
  gint fpi_std_sq_dev (const guint8 *buf,
                       gint          size);
  gint fpi_mean_sq_diff_norm (const guint8 *buf1,
 diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
-index 00289b4..4368b82 100644
+index 00289b4..2ecc289 100644
 --- a/libfprint/fpi-print.c
 +++ b/libfprint/fpi-print.c
 @@ -18,6 +18,8 @@
@@ -539,7 +635,7 @@ index 00289b4..4368b82 100644
      {
        g_set_error (error,
                     G_IO_ERROR,
-@@ -168,24 +181,29 @@ fpi_print_add_from_image (FpPrint *print,
+@@ -168,24 +181,40 @@ fpi_print_add_from_image (FpPrint *print,
                     "Cannot add print data from image!");
        return FALSE;
      }
@@ -571,7 +667,18 @@ index 00289b4..4368b82 100644
 +    }
 +  else if (print->type == FPI_PRINT_SIGFM)
 +    {
-+      SigfmImgInfo * info = fp_image_get_sigfm_info (image);
++      /* Take the keypoints rather than borrow them: print->prints frees its
++         elements with sigfm_free_info() and so does fp_image_finalize(), so
++         sharing the pointer double-frees as soon as a print is dropped. */
++      SigfmImgInfo * info = fp_image_steal_sigfm_info (image);
++
++      if (!info)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                       "No SIGFM keypoints in image or not yet extracted!");
++          return FALSE;
++        }
++
 +      g_ptr_array_add (print->prints, info);
      }
 -
@@ -585,7 +692,7 @@ index 00289b4..4368b82 100644
  
    g_clear_object (&print->image);
    print->image = g_object_ref (image);
-@@ -217,7 +235,7 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
+@@ -217,7 +246,7 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
    gint i;
  
    /* XXX: Use a different error type? */
@@ -594,7 +701,7 @@ index 00289b4..4368b82 100644
      {
        *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
                                           "It is only possible to match NBIS type print data");
-@@ -249,6 +267,51 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
+@@ -249,6 +278,51 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
    return FPI_MATCH_FAIL;
  }
  

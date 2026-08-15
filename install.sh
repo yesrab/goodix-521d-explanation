@@ -23,7 +23,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1388,6 +1388,37 @@ edits.append((
 #define GOODIX52XD_STRETCH_CLIP_PERMILLE %(clip)s
 
 /**
+ * @brief Replaces the sensor's dead border with its nearest live neighbour.
+ *
+ * @details Column 0, column 63, row 0 and row 79 are guard pixels: on a real
+ * 521d they read ~600 while the interior reads ~4000, and in the sensor's
+ * dark mode they read a flat 0. They carry no ridge data, but they are
+ * identical in every capture, so left alone they become a maximum-contrast
+ * rectangle around every image — a feature NBIS and SIFT both latch onto, and
+ * the same one in everybody's print. goodix511 sidesteps this by cropping
+ * (crop_frame in goodix511.c); extending the interior outwards costs nothing
+ * and keeps the image dimensions the driver advertises.
+ */
+static void goodix52xd_repair_border(Goodix52xdPix* frame)
+{
+    guint x, y;
+
+    for (x = 0; x != GOODIX52XD_WIDTH; ++x) {
+        guint sx = CLAMP(x, 1, GOODIX52XD_WIDTH - 2);
+
+        frame[x] = frame[sx + GOODIX52XD_WIDTH];
+        frame[x + (GOODIX52XD_HEIGHT - 1) * GOODIX52XD_WIDTH] =
+            frame[sx + (GOODIX52XD_HEIGHT - 2) * GOODIX52XD_WIDTH];
+    }
+
+    for (y = 0; y != GOODIX52XD_HEIGHT; ++y) {
+        frame[y * GOODIX52XD_WIDTH] = frame[y * GOODIX52XD_WIDTH + 1];
+        frame[y * GOODIX52XD_WIDTH + GOODIX52XD_WIDTH - 1] =
+            frame[y * GOODIX52XD_WIDTH + GOODIX52XD_WIDTH - 2];
+    }
+}
+
+/**
  * @brief Folds an idle frame into the background estimate. Takes ownership.
  *
  * @details goodix52xd_frame_is_empty() is a heuristic, and a light touch can
@@ -1404,6 +1435,8 @@ static void goodix52xd_note_idle_frame(FpiDeviceGoodixTls52XD* self,
                                        Goodix52xdPix* frame)
 {
     guint i;
+
+    goodix52xd_repair_border(frame);
 
     if (!self->background || self->background_used) {
         g_free(self->background);
@@ -1547,6 +1580,7 @@ edits.append((
     """        fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
         self->finger_reported = TRUE;
 
+        goodix52xd_repair_border(frame);
         goodix52xd_apply_background(frame, self->background);
         self->background_used = TRUE;
         img = goodix52xd_image_from_frame(frame);
